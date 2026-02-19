@@ -47,7 +47,9 @@ impl ImportAnalyzer {
             .build();
 
         for entry in walker {
-            let entry = entry.into_diagnostic().context("Failed to read directory entry")?;
+            let entry = entry
+                .into_diagnostic()
+                .context("Failed to read directory entry")?;
             let path = entry.path();
 
             if !path.is_file() {
@@ -93,7 +95,10 @@ fn is_js_ts_file(path: &Path) -> bool {
         return false;
     };
 
-    matches!(ext, "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts")
+    matches!(
+        ext,
+        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts"
+    )
 }
 
 /// Check if a file is likely a test file
@@ -201,10 +206,7 @@ mod tests {
 
     #[test]
     fn test_extract_package_name() {
-        assert_eq!(
-            extract_package_name("lodash"),
-            Some("lodash".to_string())
-        );
+        assert_eq!(extract_package_name("lodash"), Some("lodash".to_string()));
         assert_eq!(
             extract_package_name("lodash/fp"),
             Some("lodash".to_string())

@@ -14,7 +14,10 @@ pub struct NpmLockfileParser<'a> {
 
 impl<'a> NpmLockfileParser<'a> {
     pub fn new(root: &'a Path, lockfile_path: &'a Path) -> Self {
-        Self { root, lockfile_path }
+        Self {
+            root,
+            lockfile_path,
+        }
     }
 
     pub fn parse(&self) -> Result<HashMap<String, Package>> {
@@ -128,11 +131,7 @@ impl<'a> NpmLockfileParser<'a> {
                 let is_direct = direct_deps.contains(name);
                 let is_dev = dep.dev.unwrap_or(false) || dev_deps.contains(name);
 
-                let dependencies: Vec<String> = dep
-                    .requires
-                    .keys()
-                    .cloned()
-                    .collect();
+                let dependencies: Vec<String> = dep.requires.keys().cloned().collect();
 
                 let package = Package {
                     name: name.clone(),
@@ -153,6 +152,95 @@ impl<'a> NpmLockfileParser<'a> {
         collect_deps(&lockfile.dependencies, &mut packages, direct_deps, dev_deps);
 
         Ok(packages)
+    }
+
+    pub fn parse_for_duplicates(
+        &self,
+    ) -> Result<HashMap<String, Vec<crate::lockfile::CargoPackageInfo>>> {
+        let content = std::fs::read_to_string(self.lockfile_path)
+            .into_diagnostic()
+            .with_context(|| format!("Failed to read {}", self.lockfile_path.display()))?;
+
+        let lockfile: NpmLockfile = serde_json::from_str(&content)
+            .into_diagnostic()
+            .with_context(|| "Failed to parse package-lock.json")?;
+
+        let mut by_name: HashMap<String, Vec<crate::lockfile::CargoPackageInfo>> = HashMap::new();
+        let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+
+        // Build reverse dependency map for npm (v3)
+        for (path, pkg_info) in &lockfile.packages {
+            let pkg_name = if path.is_empty() {
+                // For root, try to get name from pkg_info or use "root"
+                pkg_info.name.clone().unwrap_or_else(|| "root".to_string())
+            } else {
+                extract_package_name_from_path(path)
+            };
+
+            let pkg_version = pkg_info.version.clone().unwrap_or_default();
+            let pkg_key = format!("{}@{}", pkg_name, pkg_version);
+
+            for dep_name in pkg_info.dependencies.keys() {
+                // In npm, we don't always know the exact version of the dependency from the packages map alone
+                // without resolving it. For simplicity in duplicate analysis, we'll map to the name for now,
+                // or try to find the resolved path if possible.
+                // However, the Cargo model uses name@version for keys.
+                // For npm, we'll try to find the dependency version in the packages list.
+
+                // Simplified: search for the dependency in node_modules
+                let dep_path = if path.is_empty() {
+                    format!("node_modules/{}", dep_name)
+                } else {
+                    format!("{}/node_modules/{}", path, dep_name)
+                };
+
+                // If not found nested, it's likely at the root node_modules
+                let actual_dep_path = if lockfile.packages.contains_key(&dep_path) {
+                    dep_path
+                } else {
+                    format!("node_modules/{}", dep_name)
+                };
+
+                if let Some(target_pkg) = lockfile.packages.get(&actual_dep_path) {
+                    let target_version = target_pkg.version.clone().unwrap_or_default();
+                    let target_key = format!("{}@{}", dep_name, target_version);
+
+                    dependents
+                        .entry(target_key)
+                        .or_default()
+                        .push(pkg_key.clone());
+                } else {
+                    // Fallback to just name if can't resolve version
+                    dependents
+                        .entry(dep_name.clone())
+                        .or_default()
+                        .push(pkg_key.clone());
+                }
+            }
+        }
+
+        // Group by name
+        for (path, pkg_info) in &lockfile.packages {
+            if path.is_empty() {
+                continue;
+            }
+
+            let name = extract_package_name_from_path(path);
+            let version = pkg_info.version.clone().unwrap_or_default();
+            let key = format!("{}@{}", name, version);
+            let pkg_dependents = dependents.get(&key).cloned().unwrap_or_default();
+
+            let versions = by_name.entry(name).or_default();
+            if !versions.iter().any(|v| v.version == version) {
+                versions.push(crate::lockfile::CargoPackageInfo {
+                    version,
+                    dependents: pkg_dependents,
+                    is_path_dep: false, // npm doesn't have a direct equivalent here easily
+                });
+            }
+        }
+
+        Ok(by_name)
     }
 }
 
@@ -198,6 +286,7 @@ struct NpmLockfile {
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct NpmPackageInfo {
+    name: Option<String>,
     version: Option<String>,
 
     #[serde(default)]

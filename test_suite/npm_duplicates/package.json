@@ -1,0 +1,7 @@
+{
+  "name": "npm-test",
+  "dependencies": {
+    "pkg-a": "1.0.0",
+    "pkg-b": "1.0.0"
+  }
+}

@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity, clippy::collapsible_match)]
+
 mod analyzer;
 mod duplicates;
 mod graph;
@@ -6,7 +8,7 @@ mod reporter;
 mod types;
 mod vulnerability;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use miette::Result;
@@ -18,7 +20,11 @@ use crate::reporter::Reporter;
 
 #[derive(Parser)]
 #[command(name = "depx")]
-#[command(author, version, about = "Intelligent dependency analyzer for JS/TS projects")]
+#[command(
+    author,
+    version,
+    about = "Intelligent dependency analyzer for JS/TS projects"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -106,7 +112,11 @@ async fn main() -> Result<()> {
         Commands::Deprecated { path } => {
             run_deprecated(&path).await?;
         }
-        Commands::Duplicates { path, verbose, json } => {
+        Commands::Duplicates {
+            path,
+            verbose,
+            json,
+        } => {
             run_duplicates(&path, verbose, json).await?;
         }
     }
@@ -210,7 +220,7 @@ async fn run_deprecated(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn run_duplicates(path: &PathBuf, verbose: bool, json: bool) -> Result<()> {
+async fn run_duplicates(path: &Path, verbose: bool, json: bool) -> Result<()> {
     let reporter = if verbose {
         Reporter::new().verbose()
     } else {

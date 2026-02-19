@@ -24,7 +24,10 @@ impl<'a> DuplicateAnalyzer<'a> {
 
         match lockfile_parser.lockfile_type() {
             LockfileType::Cargo => self.analyze_cargo(lockfile_parser.lockfile_path()),
-            _ => bail!("Duplicate analysis currently only supports Cargo.lock (Rust projects)"),
+            LockfileType::Npm => self.analyze_npm(lockfile_parser.lockfile_path()),
+            _ => {
+                bail!("Duplicate analysis currently only supports Cargo.lock and package-lock.json")
+            }
         }
     }
 
@@ -32,10 +35,23 @@ impl<'a> DuplicateAnalyzer<'a> {
     fn analyze_cargo(&self, lockfile_path: &Path) -> Result<DuplicateAnalysis> {
         let parser = CargoLockfileParser::new(lockfile_path);
         let packages_by_name = parser.parse_for_duplicates()?;
+        self.analyze_generic(packages_by_name)
+    }
 
+    /// Analyze package-lock.json for duplicates
+    fn analyze_npm(&self, lockfile_path: &Path) -> Result<DuplicateAnalysis> {
+        let parser = crate::lockfile::NpmLockfileParser::new(self.root, lockfile_path);
+        let packages_by_name = parser.parse_for_duplicates()?;
+        self.analyze_generic(packages_by_name)
+    }
+
+    fn analyze_generic(
+        &self,
+        packages_by_name: std::collections::HashMap<String, Vec<crate::lockfile::CargoPackageInfo>>,
+    ) -> Result<DuplicateAnalysis> {
         let mut duplicates = Vec::new();
 
-        for (name, versions) in packages_by_name {
+        for (name, versions) in &packages_by_name {
             // Skip if only one version exists
             if versions.len() <= 1 {
                 continue;
@@ -43,24 +59,28 @@ impl<'a> DuplicateAnalyzer<'a> {
 
             // Build version info
             let mut version_infos: Vec<DuplicateVersion> = versions
-                .into_iter()
-                .map(|v| DuplicateVersion {
-                    version: v.version,
-                    dependents: v.dependents,
-                    transitive_count: 0, // TODO: calculate transitive dependents
+                .iter()
+                .map(|v| {
+                    let full_key = format!("{}@{}", name, v.version);
+                    let transitive_count =
+                        calculate_transitive_dependents(&full_key, &packages_by_name);
+
+                    DuplicateVersion {
+                        version: v.version.clone(),
+                        dependents: v.dependents.clone(),
+                        transitive_count,
+                    }
                 })
                 .collect();
 
             // Sort versions for consistent output
-            version_infos.sort_by(|a, b| {
-                compare_versions(&a.version, &b.version)
-            });
+            version_infos.sort_by(|a, b| compare_versions(&a.version, &b.version));
 
             // Calculate severity
             let severity = calculate_severity(&version_infos);
 
             duplicates.push(DuplicateGroup {
-                name,
+                name: name.clone(),
                 versions: version_infos,
                 severity,
             });
@@ -68,20 +88,76 @@ impl<'a> DuplicateAnalyzer<'a> {
 
         // Sort by severity (high first), then by name
         duplicates.sort_by(|a, b| {
-            b.severity.cmp(&a.severity).then_with(|| a.name.cmp(&b.name))
+            b.severity
+                .cmp(&a.severity)
+                .then_with(|| a.name.cmp(&b.name))
         });
 
         // Calculate stats
         let stats = DuplicateStats {
             total_duplicates: duplicates.len(),
-            high_severity: duplicates.iter().filter(|d| d.severity == DuplicateSeverity::High).count(),
-            medium_severity: duplicates.iter().filter(|d| d.severity == DuplicateSeverity::Medium).count(),
-            low_severity: duplicates.iter().filter(|d| d.severity == DuplicateSeverity::Low).count(),
+            high_severity: duplicates
+                .iter()
+                .filter(|d| d.severity == DuplicateSeverity::High)
+                .count(),
+            medium_severity: duplicates
+                .iter()
+                .filter(|d| d.severity == DuplicateSeverity::Medium)
+                .count(),
+            low_severity: duplicates
+                .iter()
+                .filter(|d| d.severity == DuplicateSeverity::Low)
+                .count(),
             extra_compile_units: duplicates.iter().map(|d| d.versions.len() - 1).sum(),
         };
 
         Ok(DuplicateAnalysis { duplicates, stats })
     }
+}
+
+/// Calculate the number of transitive dependents for a package version
+fn calculate_transitive_dependents(
+    package_key: &str,
+    packages_by_name: &std::collections::HashMap<String, Vec<crate::lockfile::CargoPackageInfo>>,
+) -> usize {
+    use std::collections::{HashSet, VecDeque};
+
+    // First, we need a way to look up a package by its name@version key
+    // We can build this map once if we want to optimize, but we'll search
+    let mut reverse_graph: std::collections::HashMap<String, &Vec<String>> =
+        std::collections::HashMap::new();
+    for (name, versions) in packages_by_name {
+        for v in versions {
+            let key = format!("{}@{}", name, v.version);
+            reverse_graph.insert(key, &v.dependents);
+        }
+    }
+
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+
+    // Start with the initial dependents
+    if let Some(deps) = reverse_graph.get(package_key) {
+        for dep in *deps {
+            if visited.insert(dep.clone()) {
+                queue.push_back(dep.clone());
+            }
+        }
+    }
+
+    let mut count = 0;
+    while let Some(current) = queue.pop_front() {
+        count += 1;
+        if let Some(deps) = reverse_graph.get(&current) {
+            for dep in *deps {
+                if visited.insert(dep.clone()) {
+                    queue.push_back(dep.clone());
+                }
+            }
+        }
+    }
+
+    count
 }
 
 /// Compare two version strings, handling semver and non-semver
@@ -214,9 +290,72 @@ mod tests {
     }
 
     #[test]
+    fn test_transitive_calculation() {
+        use crate::lockfile::CargoPackageInfo;
+        use std::collections::HashMap;
+
+        // Setup a mock dependency graph:
+        // Root -> A@1.0.0 -> B@1.0.0 -> C@1.0.0
+        // Root -> D@1.0.0 -> B@1.0.0
+
+        let mut packages = HashMap::new();
+
+        packages.insert(
+            "A".to_string(),
+            vec![CargoPackageInfo {
+                version: "1.0.0".to_string(),
+                dependents: vec!["root".to_string()],
+                is_path_dep: false,
+            }],
+        );
+
+        packages.insert(
+            "B".to_string(),
+            vec![CargoPackageInfo {
+                version: "1.0.0".to_string(),
+                dependents: vec!["A@1.0.0".to_string(), "D@1.0.0".to_string()],
+                is_path_dep: false,
+            }],
+        );
+
+        packages.insert(
+            "C".to_string(),
+            vec![CargoPackageInfo {
+                version: "1.0.0".to_string(),
+                dependents: vec!["B@1.0.0".to_string()],
+                is_path_dep: false,
+            }],
+        );
+
+        packages.insert(
+            "D".to_string(),
+            vec![CargoPackageInfo {
+                version: "1.0.0".to_string(),
+                dependents: vec!["root".to_string()],
+                is_path_dep: false,
+            }],
+        );
+
+        // Transitive dependents of C@1.0.0: B@1.0.0, A@1.0.0, D@1.0.0, root (4 total)
+        assert_eq!(calculate_transitive_dependents("C@1.0.0", &packages), 4);
+
+        // Transitive dependents of B@1.0.0: A@1.0.0, D@1.0.0, root (3 total)
+        assert_eq!(calculate_transitive_dependents("B@1.0.0", &packages), 3);
+
+        // Transitive dependents of A@1.0.0: root (1 total)
+        assert_eq!(calculate_transitive_dependents("A@1.0.0", &packages), 1);
+    }
+
+    #[test]
     fn test_compare_versions() {
         assert_eq!(compare_versions("1.0.0", "2.0.0"), std::cmp::Ordering::Less);
-        assert_eq!(compare_versions("1.2.0", "1.1.0"), std::cmp::Ordering::Greater);
-        assert_eq!(compare_versions("1.0.0", "1.0.0"), std::cmp::Ordering::Equal);
+        assert_eq!(
+            compare_versions("1.2.0", "1.1.0"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("1.0.0", "1.0.0"),
+            std::cmp::Ordering::Equal
+        );
     }
 }

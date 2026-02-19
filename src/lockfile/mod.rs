@@ -8,7 +8,7 @@ use miette::{bail, Result};
 
 use crate::types::Package;
 
-pub use cargo::CargoLockfileParser;
+pub use cargo::{CargoLockfileParser, CargoPackageInfo};
 pub use npm::NpmLockfileParser;
 
 /// Unified lockfile parser that auto-detects the lockfile type

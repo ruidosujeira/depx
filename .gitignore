@@ -1,1 +1,5 @@
 /target
+package-lock.json
+node_modules
+cargo_output.txt
+npm_output.txt

@@ -1,0 +1,43 @@
+[[package]]
+name = "depx"
+version = "0.3.0"
+dependencies = [
+ "pkg-a 1.0.0",
+ "pkg-d 1.0.0",
+]
+
+[[package]]
+name = "pkg-a"
+version = "1.0.0"
+dependencies = [
+ "pkg-b 1.0.0",
+]
+
+[[package]]
+name = "pkg-b"
+version = "1.0.0"
+dependencies = [
+ "pkg-c 1.0.0",
+]
+
+[[package]]
+name = "pkg-c"
+version = "1.0.0"
+dependencies = [
+ "serde 1.0.150",
+]
+
+[[package]]
+name = "pkg-d"
+version = "1.0.0"
+dependencies = [
+ "serde 1.0.152",
+]
+
+[[package]]
+name = "serde"
+version = "1.0.150"
+
+[[package]]
+name = "serde"
+version = "1.0.152"
