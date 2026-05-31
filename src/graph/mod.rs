@@ -48,7 +48,11 @@ impl DependencyGraph {
     }
 
     /// Analyze which packages are used vs unused
-    pub fn analyze_usage(&self, used_packages: &HashSet<String>, include_dev: bool) -> UsageAnalysis {
+    pub fn analyze_usage(
+        &self,
+        used_packages: &HashSet<String>,
+        include_dev: bool,
+    ) -> UsageAnalysis {
         let mut used = Vec::new();
         let mut unused = Vec::new();
         let mut expected_unused = Vec::new();
@@ -144,9 +148,7 @@ impl DependencyGraph {
 
         let is_dev_path = chains.iter().any(|chain| {
             chain.first().map_or(false, |root| {
-                self.packages
-                    .get(root)
-                    .map_or(false, |p| p.is_dev)
+                self.packages.get(root).map_or(false, |p| p.is_dev)
             })
         });
 
@@ -163,7 +165,11 @@ impl DependencyGraph {
         let target_name = &self.graph[target];
 
         // If it's a direct dependency, return a single-element chain
-        if self.packages.get(target_name).map_or(false, |p| p.is_direct) {
+        if self
+            .packages
+            .get(target_name)
+            .map_or(false, |p| p.is_direct)
+        {
             return vec![vec![target_name.clone()]];
         }
 
@@ -188,7 +194,11 @@ impl DependencyGraph {
                 new_path.extend(path.clone());
 
                 // If this is a direct dependency, we found a complete chain
-                if self.packages.get(neighbor_name).map_or(false, |p| p.is_direct) {
+                if self
+                    .packages
+                    .get(neighbor_name)
+                    .map_or(false, |p| p.is_direct)
+                {
                     if !visited_paths.contains(&new_path) {
                         visited_paths.insert(new_path.clone());
                         chains.push(new_path);
@@ -376,14 +386,10 @@ mod tests {
 
         packages.insert(
             "body-parser".to_string(),
-            Package::new("body-parser", "1.20.0")
-                .with_dependencies(vec!["raw-body".to_string()]),
+            Package::new("body-parser", "1.20.0").with_dependencies(vec!["raw-body".to_string()]),
         );
 
-        packages.insert(
-            "raw-body".to_string(),
-            Package::new("raw-body", "2.5.0"),
-        );
+        packages.insert("raw-body".to_string(), Package::new("raw-body", "2.5.0"));
 
         packages.insert(
             "unused-pkg".to_string(),

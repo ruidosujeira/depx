@@ -14,7 +14,10 @@ pub struct NpmLockfileParser<'a> {
 
 impl<'a> NpmLockfileParser<'a> {
     pub fn new(root: &'a Path, lockfile_path: &'a Path) -> Self {
-        Self { root, lockfile_path }
+        Self {
+            root,
+            lockfile_path,
+        }
     }
 
     pub fn parse(&self) -> Result<HashMap<String, Package>> {
@@ -128,11 +131,7 @@ impl<'a> NpmLockfileParser<'a> {
                 let is_direct = direct_deps.contains(name);
                 let is_dev = dep.dev.unwrap_or(false) || dev_deps.contains(name);
 
-                let dependencies: Vec<String> = dep
-                    .requires
-                    .keys()
-                    .cloned()
-                    .collect();
+                let dependencies: Vec<String> = dep.requires.keys().cloned().collect();
 
                 let package = Package {
                     name: name.clone(),

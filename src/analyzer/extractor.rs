@@ -242,8 +242,14 @@ import sub from '@scope/package/subpath';
 "#;
         let imports = extract_imports(source);
         assert_eq!(imports.len(), 2);
-        assert_eq!(imports[0].resolved_package, Some("@scope/package".to_string()));
-        assert_eq!(imports[1].resolved_package, Some("@scope/package".to_string()));
+        assert_eq!(
+            imports[0].resolved_package,
+            Some("@scope/package".to_string())
+        );
+        assert_eq!(
+            imports[1].resolved_package,
+            Some("@scope/package".to_string())
+        );
     }
 
     #[test]

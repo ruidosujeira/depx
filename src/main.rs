@@ -18,7 +18,11 @@ use crate::reporter::Reporter;
 
 #[derive(Parser)]
 #[command(name = "depx")]
-#[command(author, version, about = "Intelligent dependency analyzer for JS/TS projects")]
+#[command(
+    author,
+    version,
+    about = "Intelligent dependency analyzer for JS/TS projects"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -106,7 +110,11 @@ async fn main() -> Result<()> {
         Commands::Deprecated { path } => {
             run_deprecated(&path).await?;
         }
-        Commands::Duplicates { path, verbose, json } => {
+        Commands::Duplicates {
+            path,
+            verbose,
+            json,
+        } => {
             run_duplicates(&path, verbose, json).await?;
         }
     }
