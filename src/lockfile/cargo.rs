@@ -16,8 +16,6 @@ pub struct CargoLockfileParser<'a> {
 #[derive(Debug, Deserialize)]
 struct CargoLockfile {
     #[serde(default)]
-    version: Option<u32>,
-    #[serde(default)]
     package: Vec<CargoPackage>,
 }
 
@@ -132,7 +130,6 @@ impl<'a> CargoLockfileParser<'a> {
                 .push(CargoPackageInfo {
                     version: pkg.version.clone(),
                     dependents: pkg_dependents,
-                    is_path_dep: pkg.source.is_none(),
                 });
         }
 
@@ -145,5 +142,4 @@ impl<'a> CargoLockfileParser<'a> {
 pub struct CargoPackageInfo {
     pub version: String,
     pub dependents: Vec<String>,
-    pub is_path_dep: bool,
 }

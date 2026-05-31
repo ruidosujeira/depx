@@ -184,9 +184,6 @@ fn extract_package_name_from_path(path: &str) -> String {
 #[serde(rename_all = "camelCase")]
 struct NpmLockfile {
     #[serde(default)]
-    lockfile_version: u32,
-
-    #[serde(default)]
     packages: HashMap<String, NpmPackageInfo>,
 
     // v1 format
@@ -203,16 +200,10 @@ struct NpmPackageInfo {
     dev: Option<bool>,
 
     #[serde(default)]
-    optional: Option<bool>,
-
-    #[serde(default)]
     dependencies: HashMap<String, String>,
 
     #[serde(default)]
     optional_dependencies: HashMap<String, String>,
-
-    #[serde(default)]
-    peer_dependencies: HashMap<String, String>,
 
     deprecated: Option<String>,
 }
@@ -239,12 +230,6 @@ struct PackageJson {
 
     #[serde(default)]
     dev_dependencies: HashMap<String, String>,
-
-    #[serde(default)]
-    peer_dependencies: HashMap<String, String>,
-
-    #[serde(default)]
-    optional_dependencies: HashMap<String, String>,
 }
 
 #[cfg(test)]

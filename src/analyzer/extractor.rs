@@ -48,13 +48,10 @@ impl<'a> ImportExtractor<'a> {
             // ES6 imports: import x from 'package'
             Statement::ImportDeclaration(decl) => {
                 let specifier = decl.source.value.as_str();
-                let line = self.line_number(decl.span.start);
 
                 if let Some(package_name) = extract_package_name(specifier) {
                     imports.push(Import {
                         file_path: self.path.to_path_buf(),
-                        line,
-                        specifier: specifier.to_string(),
                         kind: ImportKind::EsModule,
                         resolved_package: Some(package_name),
                     });
@@ -65,13 +62,10 @@ impl<'a> ImportExtractor<'a> {
             Statement::ExportNamedDeclaration(decl) => {
                 if let Some(source) = &decl.source {
                     let specifier = source.value.as_str();
-                    let line = self.line_number(decl.span.start);
 
                     if let Some(package_name) = extract_package_name(specifier) {
                         imports.push(Import {
                             file_path: self.path.to_path_buf(),
-                            line,
-                            specifier: specifier.to_string(),
                             kind: ImportKind::ReExport,
                             resolved_package: Some(package_name),
                         });
@@ -82,13 +76,10 @@ impl<'a> ImportExtractor<'a> {
             // export * from 'package'
             Statement::ExportAllDeclaration(decl) => {
                 let specifier = decl.source.value.as_str();
-                let line = self.line_number(decl.span.start);
 
                 if let Some(package_name) = extract_package_name(specifier) {
                     imports.push(Import {
                         file_path: self.path.to_path_buf(),
-                        line,
-                        specifier: specifier.to_string(),
                         kind: ImportKind::ReExport,
                         resolved_package: Some(package_name),
                     });
@@ -120,20 +111,15 @@ impl<'a> ImportExtractor<'a> {
                 // Check for require()
                 if let Expression::Identifier(ident) = &call.callee {
                     if ident.name == "require" {
-                        if let Some(first_arg) = call.arguments.first() {
-                            if let Argument::StringLiteral(lit) = first_arg {
-                                let specifier = lit.value.as_str();
-                                let line = self.line_number(call.span.start);
+                        if let Some(Argument::StringLiteral(lit)) = call.arguments.first() {
+                            let specifier = lit.value.as_str();
 
-                                if let Some(package_name) = extract_package_name(specifier) {
-                                    imports.push(Import {
-                                        file_path: self.path.to_path_buf(),
-                                        line,
-                                        specifier: specifier.to_string(),
-                                        kind: ImportKind::CommonJs,
-                                        resolved_package: Some(package_name),
-                                    });
-                                }
+                            if let Some(package_name) = extract_package_name(specifier) {
+                                imports.push(Import {
+                                    file_path: self.path.to_path_buf(),
+                                    kind: ImportKind::CommonJs,
+                                    resolved_package: Some(package_name),
+                                });
                             }
                         }
                     }
@@ -153,13 +139,10 @@ impl<'a> ImportExtractor<'a> {
             Expression::ImportExpression(import_expr) => {
                 if let Expression::StringLiteral(lit) = &import_expr.source {
                     let specifier = lit.value.as_str();
-                    let line = self.line_number(import_expr.span.start);
 
                     if let Some(package_name) = extract_package_name(specifier) {
                         imports.push(Import {
                             file_path: self.path.to_path_buf(),
-                            line,
-                            specifier: specifier.to_string(),
                             kind: ImportKind::Dynamic,
                             resolved_package: Some(package_name),
                         });
@@ -188,14 +171,6 @@ impl<'a> ImportExtractor<'a> {
 
             _ => {}
         }
-    }
-
-    fn line_number(&self, offset: u32) -> usize {
-        self.source[..offset as usize]
-            .chars()
-            .filter(|c| *c == '\n')
-            .count()
-            + 1
     }
 }
 

@@ -42,11 +42,6 @@ impl Package {
         self
     }
 
-    pub fn dev(mut self) -> Self {
-        self.is_dev = true;
-        self
-    }
-
     pub fn with_dependencies(mut self, deps: Vec<String>) -> Self {
         self.dependencies = deps;
         self
@@ -59,13 +54,9 @@ pub struct Import {
     /// The source file containing the import
     pub file_path: PathBuf,
 
-    /// Line number in the source file
-    pub line: usize,
-
-    /// The import specifier (e.g., "lodash", "./utils", "@scope/package")
-    pub specifier: String,
-
-    /// The kind of import
+    /// The kind of import. Retained for classification and verified by the
+    /// extractor tests, though the analyzer itself only keys off the package.
+    #[allow(dead_code)]
     pub kind: ImportKind,
 
     /// Resolved package name (for node_modules imports)
@@ -138,10 +129,6 @@ impl ImportMap {
     pub fn get_package_usages(&self, package: &str) -> Option<&Vec<Import>> {
         self.package_imports.get(package)
     }
-
-    pub fn imports_by_file(&self) -> &HashMap<PathBuf, Vec<Import>> {
-        &self.imports_by_file
-    }
 }
 
 /// Result of analyzing dependency usage
@@ -152,13 +139,6 @@ pub struct UsageAnalysis {
 
     /// Packages installed but never imported (truly removable)
     pub unused: Vec<Package>,
-
-    /// Packages that are "expected unused" - dev/build tools that aren't imported
-    /// These are @types/*, linters, bundlers, test runners, etc.
-    pub expected_unused: Vec<Package>,
-
-    /// Packages used only in dev context
-    pub dev_only: Vec<Package>,
 
     /// Direct dependencies that are unused (truly removable)
     pub unused_direct: Vec<Package>,

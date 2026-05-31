@@ -6,15 +6,24 @@ mod reporter;
 mod types;
 mod vulnerability;
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use miette::Result;
 
 use crate::analyzer::ImportAnalyzer;
 use crate::graph::DependencyGraph;
-use crate::lockfile::LockfileParser;
+use crate::lockfile::{LockfileParser, LockfileType};
 use crate::reporter::Reporter;
+
+/// Map a detected lockfile to its OSV ecosystem identifier.
+fn osv_ecosystem(lockfile_type: LockfileType) -> &'static str {
+    match lockfile_type {
+        LockfileType::Cargo => "crates.io",
+        _ => "npm",
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "depx")]
@@ -122,7 +131,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_analyze(path: &PathBuf, show_unused_only: bool, include_dev: bool) -> Result<()> {
+async fn run_analyze(path: &Path, show_unused_only: bool, include_dev: bool) -> Result<()> {
     let reporter = Reporter::new();
 
     reporter.status("Analyzing", &format!("project at {}", path.display()));
@@ -150,8 +159,7 @@ async fn run_analyze(path: &PathBuf, show_unused_only: bool, include_dev: bool) 
     let graph = DependencyGraph::new(&installed_packages);
 
     // 4. Cross-reference to find unused packages
-    let used_packages = imports.packages_used();
-    let analysis = graph.analyze_usage(&used_packages, include_dev);
+    let analysis = graph.analyze_usage(&imports, include_dev);
 
     // 5. Report results
     if show_unused_only {
@@ -163,7 +171,7 @@ async fn run_analyze(path: &PathBuf, show_unused_only: bool, include_dev: bool) 
     Ok(())
 }
 
-async fn run_why(path: &PathBuf, package: &str) -> Result<()> {
+async fn run_why(path: &Path, package: &str) -> Result<()> {
     let reporter = Reporter::new();
 
     let lockfile_parser = LockfileParser::new(path)?;
@@ -179,12 +187,13 @@ async fn run_why(path: &PathBuf, package: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_audit(path: &PathBuf, used_only: bool) -> Result<()> {
+async fn run_audit(path: &Path, used_only: bool) -> Result<()> {
     let reporter = Reporter::new();
 
     reporter.status("Auditing", &format!("project at {}", path.display()));
 
     let lockfile_parser = LockfileParser::new(path)?;
+    let ecosystem = osv_ecosystem(lockfile_parser.lockfile_type());
     let installed_packages = lockfile_parser.parse()?;
 
     let used_packages = if used_only {
@@ -195,15 +204,24 @@ async fn run_audit(path: &PathBuf, used_only: bool) -> Result<()> {
         None
     };
 
-    let vulnerabilities =
-        vulnerability::check_vulnerabilities(&installed_packages, used_packages.as_ref()).await?;
+    let mut vulnerabilities = vulnerability::check_vulnerabilities(
+        &installed_packages,
+        used_packages.as_ref(),
+        ecosystem,
+    )
+    .await?;
+
+    // `--used-only` should actually narrow the output, not just relabel it.
+    if used_only {
+        vulnerabilities.retain(|v| v.affects_used_code);
+    }
 
     reporter.report_vulnerabilities(&vulnerabilities);
 
     Ok(())
 }
 
-async fn run_deprecated(path: &PathBuf) -> Result<()> {
+async fn run_deprecated(path: &Path) -> Result<()> {
     let reporter = Reporter::new();
 
     reporter.status("Checking", "for deprecated packages");
@@ -211,14 +229,26 @@ async fn run_deprecated(path: &PathBuf) -> Result<()> {
     let lockfile_parser = LockfileParser::new(path)?;
     let installed_packages = lockfile_parser.parse()?;
 
-    let deprecated = vulnerability::check_deprecated(&installed_packages).await?;
+    // Determine which packages are actually reachable from the source code so
+    // we can flag deprecated packages that are still in use.
+    let analyzer = ImportAnalyzer::new(path);
+    let imports = analyzer.analyze()?;
+    let graph = DependencyGraph::new(&installed_packages);
+    let analysis = graph.analyze_usage(&imports, true);
+    let used_set: HashSet<String> = analysis
+        .used
+        .iter()
+        .map(|u| u.package.name.clone())
+        .collect();
+
+    let deprecated = vulnerability::check_deprecated(&installed_packages, Some(&used_set)).await?;
 
     reporter.report_deprecated(&deprecated);
 
     Ok(())
 }
 
-async fn run_duplicates(path: &PathBuf, verbose: bool, json: bool) -> Result<()> {
+async fn run_duplicates(path: &Path, verbose: bool, json: bool) -> Result<()> {
     let reporter = if verbose {
         Reporter::new().verbose()
     } else {
