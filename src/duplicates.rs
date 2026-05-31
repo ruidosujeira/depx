@@ -52,9 +52,7 @@ impl<'a> DuplicateAnalyzer<'a> {
                 .collect();
 
             // Sort versions for consistent output
-            version_infos.sort_by(|a, b| {
-                compare_versions(&a.version, &b.version)
-            });
+            version_infos.sort_by(|a, b| compare_versions(&a.version, &b.version));
 
             // Calculate severity
             let severity = calculate_severity(&version_infos);
@@ -68,15 +66,26 @@ impl<'a> DuplicateAnalyzer<'a> {
 
         // Sort by severity (high first), then by name
         duplicates.sort_by(|a, b| {
-            b.severity.cmp(&a.severity).then_with(|| a.name.cmp(&b.name))
+            b.severity
+                .cmp(&a.severity)
+                .then_with(|| a.name.cmp(&b.name))
         });
 
         // Calculate stats
         let stats = DuplicateStats {
             total_duplicates: duplicates.len(),
-            high_severity: duplicates.iter().filter(|d| d.severity == DuplicateSeverity::High).count(),
-            medium_severity: duplicates.iter().filter(|d| d.severity == DuplicateSeverity::Medium).count(),
-            low_severity: duplicates.iter().filter(|d| d.severity == DuplicateSeverity::Low).count(),
+            high_severity: duplicates
+                .iter()
+                .filter(|d| d.severity == DuplicateSeverity::High)
+                .count(),
+            medium_severity: duplicates
+                .iter()
+                .filter(|d| d.severity == DuplicateSeverity::Medium)
+                .count(),
+            low_severity: duplicates
+                .iter()
+                .filter(|d| d.severity == DuplicateSeverity::Low)
+                .count(),
             extra_compile_units: duplicates.iter().map(|d| d.versions.len() - 1).sum(),
         };
 
@@ -216,7 +225,13 @@ mod tests {
     #[test]
     fn test_compare_versions() {
         assert_eq!(compare_versions("1.0.0", "2.0.0"), std::cmp::Ordering::Less);
-        assert_eq!(compare_versions("1.2.0", "1.1.0"), std::cmp::Ordering::Greater);
-        assert_eq!(compare_versions("1.0.0", "1.0.0"), std::cmp::Ordering::Equal);
+        assert_eq!(
+            compare_versions("1.2.0", "1.1.0"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("1.0.0", "1.0.0"),
+            std::cmp::Ordering::Equal
+        );
     }
 }

@@ -36,11 +36,6 @@ impl Reporter {
         println!("{:>12} {}", "Error".red().bold(), message);
     }
 
-    /// Print a warning message
-    pub fn warn(&self, message: &str) {
-        println!("{:>12} {}", "Warning".yellow().bold(), message);
-    }
-
     /// Report full analysis results
     pub fn report_full(&self, analysis: &UsageAnalysis, _imports: &ImportMap) {
         println!();
@@ -71,10 +66,7 @@ impl Reporter {
 
         // Unused direct dependencies (truly removable)
         if !analysis.unused_direct.is_empty() {
-            println!(
-                "{}",
-                "Unused Dependencies (safe to remove):".red().bold()
-            );
+            println!("{}", "Unused Dependencies (safe to remove):".red().bold());
             for pkg in &analysis.unused_direct {
                 let dev_marker = if pkg.is_dev { " (dev)" } else { "" };
                 println!(
@@ -85,11 +77,7 @@ impl Reporter {
                 );
             }
             println!();
-            println!(
-                "  {} {}",
-                "Tip:".dimmed(),
-                "npm uninstall <package>".cyan()
-            );
+            println!("  {} {}", "Tip:".dimmed(), "npm uninstall <package>".cyan());
             println!();
         }
 
@@ -115,11 +103,23 @@ impl Reporter {
             for usage in &analysis.used {
                 let pkg = &usage.package;
                 let direct_marker = if pkg.is_direct { " (direct)" } else { "" };
+                let usage_info = if usage.import_count > 0 {
+                    format!(
+                        " — {} import{} in {} file{}",
+                        usage.import_count,
+                        if usage.import_count == 1 { "" } else { "s" },
+                        usage.files.len(),
+                        if usage.files.len() == 1 { "" } else { "s" }
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
-                    "  {} {}{}",
+                    "  {} {}{}{}",
                     "+".green(),
                     format!("{}@{}", pkg.name, pkg.version).white(),
-                    direct_marker.dimmed()
+                    direct_marker.dimmed(),
+                    usage_info.dimmed()
                 );
             }
             println!();
@@ -127,17 +127,11 @@ impl Reporter {
 
         // Unused transitive dependencies (verbose only)
         if self.verbose {
-            let unused_transitive: Vec<_> = analysis
-                .unused
-                .iter()
-                .filter(|p| !p.is_direct)
-                .collect();
+            let unused_transitive: Vec<_> =
+                analysis.unused.iter().filter(|p| !p.is_direct).collect();
 
             if !unused_transitive.is_empty() {
-                println!(
-                    "{}",
-                    "Unused Transitive Dependencies:".yellow().bold()
-                );
+                println!("{}", "Unused Transitive Dependencies:".yellow().bold());
                 for pkg in unused_transitive.iter().take(20) {
                     println!(
                         "  {} {}",
@@ -162,16 +156,16 @@ impl Reporter {
         println!();
 
         if analysis.unused_direct.is_empty() && analysis.unused.is_empty() {
-            println!(
-                "{}",
-                "All dependencies appear to be in use!".green().bold()
-            );
+            println!("{}", "All dependencies appear to be in use!".green().bold());
             return;
         }
 
         println!(
             "{}",
-            "Potentially Unused Dependencies".yellow().bold().underline()
+            "Potentially Unused Dependencies"
+                .yellow()
+                .bold()
+                .underline()
         );
         println!();
 
@@ -189,8 +183,7 @@ impl Reporter {
             println!();
             println!(
                 "{}",
-                "Tip: Run `npm uninstall <package>` to remove unused packages"
-                    .dimmed()
+                "Tip: Run `npm uninstall <package>` to remove unused packages".dimmed()
             );
         }
 
@@ -198,7 +191,7 @@ impl Reporter {
     }
 
     /// Report why a package is installed
-    pub fn report_why(&self, package_name: &str, explanation: &PackageExplanation) {
+    pub fn report_why(&self, _package_name: &str, explanation: &PackageExplanation) {
         println!();
         println!(
             "{} {}@{}",
@@ -248,14 +241,12 @@ impl Reporter {
     }
 
     /// Report vulnerabilities
+    #[allow(clippy::type_complexity)]
     pub fn report_vulnerabilities(&self, vulnerabilities: &[Vulnerability]) {
         println!();
 
         if vulnerabilities.is_empty() {
-            println!(
-                "{}",
-                "No known vulnerabilities found!".green().bold()
-            );
+            println!("{}", "No known vulnerabilities found!".green().bold());
             return;
         }
 
@@ -335,10 +326,7 @@ impl Reporter {
         println!();
 
         if deprecated.is_empty() {
-            println!(
-                "{}",
-                "No deprecated packages found!".green().bold()
-            );
+            println!("{}", "No deprecated packages found!".green().bold());
             return;
         }
 
@@ -378,17 +366,11 @@ impl Reporter {
         println!();
 
         if analysis.duplicates.is_empty() {
-            println!(
-                "{}",
-                "No duplicate dependencies found!".green().bold()
-            );
+            println!("{}", "No duplicate dependencies found!".green().bold());
             return;
         }
 
-        println!(
-            "{}",
-            "Duplicate Dependencies Analysis".bold().underline()
-        );
+        println!("{}", "Duplicate Dependencies Analysis".bold().underline());
         println!();
 
         // Summary

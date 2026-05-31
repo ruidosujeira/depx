@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::Direction;
 
-use crate::types::{Package, PackageExplanation, PackageUsage, UsageAnalysis};
+use crate::types::{ImportMap, Package, PackageExplanation, PackageUsage, UsageAnalysis};
 
 /// Dependency graph for analyzing package relationships
 pub struct DependencyGraph {
@@ -48,16 +49,16 @@ impl DependencyGraph {
     }
 
     /// Analyze which packages are used vs unused
-    pub fn analyze_usage(&self, used_packages: &HashSet<String>, include_dev: bool) -> UsageAnalysis {
+    pub fn analyze_usage(&self, imports: &ImportMap, include_dev: bool) -> UsageAnalysis {
+        let used_packages = imports.packages_used();
+
         let mut used = Vec::new();
         let mut unused = Vec::new();
-        let mut expected_unused = Vec::new();
-        let mut dev_only = Vec::new();
         let mut unused_direct = Vec::new();
         let mut expected_unused_direct = Vec::new();
 
         // Get all packages that are transitively required by used packages
-        let transitively_used = self.get_transitive_dependencies(used_packages);
+        let transitively_used = self.get_transitive_dependencies(&used_packages);
 
         for (name, pkg) in &self.packages {
             // Skip dev dependencies if not included
@@ -68,21 +69,29 @@ impl DependencyGraph {
             let is_used = used_packages.contains(name) || transitively_used.contains(name);
 
             if is_used {
-                let import_count = if used_packages.contains(name) { 1 } else { 0 };
+                // Pull the real import sites for directly-imported packages.
+                // Transitive-only deps have no import sites (count 0, no files).
+                let usages = imports.get_package_usages(name);
+                let import_count = usages.map(|v| v.len()).unwrap_or(0);
+                let mut files: Vec<PathBuf> = usages
+                    .map(|v| v.iter().map(|imp| imp.file_path.clone()).collect())
+                    .unwrap_or_default();
+                files.sort();
+                files.dedup();
+
                 used.push(PackageUsage {
                     package: pkg.clone(),
                     import_count,
-                    files: Vec::new(),
+                    files,
                 });
             } else if is_expected_unused(name) {
-                // This package is not imported but that's expected (build tool, types, etc.)
-                expected_unused.push(pkg.clone());
+                // Not imported, but that's expected (build tool, types, etc.).
                 if pkg.is_direct {
                     expected_unused_direct.push(pkg.clone());
                 }
-            } else if pkg.is_dev && !pkg.is_direct {
-                dev_only.push(pkg.clone());
             } else {
+                // Truly unused: a removable direct dep, or a transitive (incl.
+                // dev) dep that nothing in the project imports.
                 unused.push(pkg.clone());
                 if pkg.is_direct {
                     unused_direct.push(pkg.clone());
@@ -93,15 +102,12 @@ impl DependencyGraph {
         // Sort for consistent output
         unused.sort_by(|a, b| a.name.cmp(&b.name));
         unused_direct.sort_by(|a, b| a.name.cmp(&b.name));
-        expected_unused.sort_by(|a, b| a.name.cmp(&b.name));
         expected_unused_direct.sort_by(|a, b| a.name.cmp(&b.name));
         used.sort_by(|a, b| a.package.name.cmp(&b.package.name));
 
         UsageAnalysis {
             used,
             unused,
-            expected_unused,
-            dev_only,
             unused_direct,
             expected_unused_direct,
         }
@@ -143,11 +149,9 @@ impl DependencyGraph {
         let chains = self.find_dependency_chains(*pkg_idx);
 
         let is_dev_path = chains.iter().any(|chain| {
-            chain.first().map_or(false, |root| {
-                self.packages
-                    .get(root)
-                    .map_or(false, |p| p.is_dev)
-            })
+            chain
+                .first()
+                .is_some_and(|root| self.packages.get(root).is_some_and(|p| p.is_dev))
         });
 
         Some(PackageExplanation {
@@ -163,7 +167,7 @@ impl DependencyGraph {
         let target_name = &self.graph[target];
 
         // If it's a direct dependency, return a single-element chain
-        if self.packages.get(target_name).map_or(false, |p| p.is_direct) {
+        if self.packages.get(target_name).is_some_and(|p| p.is_direct) {
             return vec![vec![target_name.clone()]];
         }
 
@@ -188,7 +192,11 @@ impl DependencyGraph {
                 new_path.extend(path.clone());
 
                 // If this is a direct dependency, we found a complete chain
-                if self.packages.get(neighbor_name).map_or(false, |p| p.is_direct) {
+                if self
+                    .packages
+                    .get(neighbor_name)
+                    .is_some_and(|p| p.is_direct)
+                {
                     if !visited_paths.contains(&new_path) {
                         visited_paths.insert(new_path.clone());
                         chains.push(new_path);
@@ -205,26 +213,6 @@ impl DependencyGraph {
         chains.truncate(5);
 
         chains
-    }
-
-    /// Get a package by name
-    pub fn get_package(&self, name: &str) -> Option<&Package> {
-        self.packages.get(name)
-    }
-
-    /// Get all packages
-    pub fn packages(&self) -> &HashMap<String, Package> {
-        &self.packages
-    }
-
-    /// Get count of all packages
-    pub fn package_count(&self) -> usize {
-        self.packages.len()
-    }
-
-    /// Get count of direct dependencies
-    pub fn direct_count(&self) -> usize {
-        self.packages.values().filter(|p| p.is_direct).count()
     }
 }
 
@@ -376,14 +364,10 @@ mod tests {
 
         packages.insert(
             "body-parser".to_string(),
-            Package::new("body-parser", "1.20.0")
-                .with_dependencies(vec!["raw-body".to_string()]),
+            Package::new("body-parser", "1.20.0").with_dependencies(vec!["raw-body".to_string()]),
         );
 
-        packages.insert(
-            "raw-body".to_string(),
-            Package::new("raw-body", "2.5.0"),
-        );
+        packages.insert("raw-body".to_string(), Package::new("raw-body", "2.5.0"));
 
         packages.insert(
             "unused-pkg".to_string(),
@@ -420,5 +404,57 @@ mod tests {
         // The chain should be: express -> body-parser -> raw-body
         let chain = &explanation.dependency_chains[0];
         assert_eq!(chain, &vec!["express", "body-parser", "raw-body"]);
+    }
+
+    #[test]
+    fn test_analyze_usage_reports_real_import_counts() {
+        use crate::types::{Import, ImportKind, ImportMap};
+        use std::path::PathBuf;
+
+        fn es_import(file: &str, pkg: &str) -> Import {
+            Import {
+                file_path: PathBuf::from(file),
+                kind: ImportKind::EsModule,
+                resolved_package: Some(pkg.to_string()),
+            }
+        }
+
+        let packages = create_test_packages();
+        let graph = DependencyGraph::new(&packages);
+
+        // `express` is imported three times across two distinct files.
+        let mut imports = ImportMap::new();
+        imports.add_import(es_import("src/a.ts", "express"));
+        imports.add_import(es_import("src/a.ts", "express"));
+        imports.add_import(es_import("src/b.ts", "express"));
+
+        let analysis = graph.analyze_usage(&imports, true);
+
+        // Directly-imported package: real count + deduped, sorted file list.
+        let express = analysis
+            .used
+            .iter()
+            .find(|u| u.package.name == "express")
+            .expect("express should be marked used");
+        assert_eq!(express.import_count, 3);
+        assert_eq!(
+            express.files,
+            vec![PathBuf::from("src/a.ts"), PathBuf::from("src/b.ts")]
+        );
+
+        // Transitive-only dependency: used, but with no import sites of its own.
+        let body_parser = analysis
+            .used
+            .iter()
+            .find(|u| u.package.name == "body-parser")
+            .expect("body-parser should be transitively used");
+        assert_eq!(body_parser.import_count, 0);
+        assert!(body_parser.files.is_empty());
+
+        // A direct dependency nobody imports stays flagged as unused.
+        assert!(analysis
+            .unused_direct
+            .iter()
+            .any(|p| p.name == "unused-pkg"));
     }
 }

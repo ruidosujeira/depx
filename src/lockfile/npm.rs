@@ -14,7 +14,10 @@ pub struct NpmLockfileParser<'a> {
 
 impl<'a> NpmLockfileParser<'a> {
     pub fn new(root: &'a Path, lockfile_path: &'a Path) -> Self {
-        Self { root, lockfile_path }
+        Self {
+            root,
+            lockfile_path,
+        }
     }
 
     pub fn parse(&self) -> Result<HashMap<String, Package>> {
@@ -128,11 +131,7 @@ impl<'a> NpmLockfileParser<'a> {
                 let is_direct = direct_deps.contains(name);
                 let is_dev = dep.dev.unwrap_or(false) || dev_deps.contains(name);
 
-                let dependencies: Vec<String> = dep
-                    .requires
-                    .keys()
-                    .cloned()
-                    .collect();
+                let dependencies: Vec<String> = dep.requires.keys().cloned().collect();
 
                 let package = Package {
                     name: name.clone(),
@@ -185,9 +184,6 @@ fn extract_package_name_from_path(path: &str) -> String {
 #[serde(rename_all = "camelCase")]
 struct NpmLockfile {
     #[serde(default)]
-    lockfile_version: u32,
-
-    #[serde(default)]
     packages: HashMap<String, NpmPackageInfo>,
 
     // v1 format
@@ -204,16 +200,10 @@ struct NpmPackageInfo {
     dev: Option<bool>,
 
     #[serde(default)]
-    optional: Option<bool>,
-
-    #[serde(default)]
     dependencies: HashMap<String, String>,
 
     #[serde(default)]
     optional_dependencies: HashMap<String, String>,
-
-    #[serde(default)]
-    peer_dependencies: HashMap<String, String>,
 
     deprecated: Option<String>,
 }
@@ -240,12 +230,6 @@ struct PackageJson {
 
     #[serde(default)]
     dev_dependencies: HashMap<String, String>,
-
-    #[serde(default)]
-    peer_dependencies: HashMap<String, String>,
-
-    #[serde(default)]
-    optional_dependencies: HashMap<String, String>,
 }
 
 #[cfg(test)]

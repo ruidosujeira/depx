@@ -16,8 +16,6 @@ pub struct CargoLockfileParser<'a> {
 #[derive(Debug, Deserialize)]
 struct CargoLockfile {
     #[serde(default)]
-    version: Option<u32>,
-    #[serde(default)]
     package: Vec<CargoPackage>,
 }
 
@@ -37,13 +35,11 @@ impl<'a> CargoLockfileParser<'a> {
     }
 
     pub fn parse(&self) -> Result<HashMap<String, Package>> {
-        let content = fs::read_to_string(self.lockfile_path).map_err(|e| {
-            miette::miette!("Failed to read Cargo.lock: {}", e)
-        })?;
+        let content = fs::read_to_string(self.lockfile_path)
+            .map_err(|e| miette::miette!("Failed to read Cargo.lock: {}", e))?;
 
-        let lockfile: CargoLockfile = toml::from_str(&content).map_err(|e| {
-            miette::miette!("Failed to parse Cargo.lock: {}", e)
-        })?;
+        let lockfile: CargoLockfile = toml::from_str(&content)
+            .map_err(|e| miette::miette!("Failed to parse Cargo.lock: {}", e))?;
 
         self.build_package_map(&lockfile)
     }
@@ -57,7 +53,8 @@ impl<'a> CargoLockfileParser<'a> {
             let key = format!("{}@{}", pkg.name, pkg.version);
 
             // Parse dependencies - they come as "name version" strings
-            let deps: Vec<String> = pkg.dependencies
+            let deps: Vec<String> = pkg
+                .dependencies
                 .as_ref()
                 .map(|deps| {
                     deps.iter()
@@ -74,8 +71,7 @@ impl<'a> CargoLockfileParser<'a> {
                 })
                 .unwrap_or_default();
 
-            let package = Package::new(&pkg.name, &pkg.version)
-                .with_dependencies(deps);
+            let package = Package::new(&pkg.name, &pkg.version).with_dependencies(deps);
 
             // Mark path dependencies (no source) as "direct" for now
             // In Cargo, the root crate has no source field
@@ -94,13 +90,11 @@ impl<'a> CargoLockfileParser<'a> {
     /// Parse and return raw package data for duplicate analysis
     /// Returns a map of package name -> list of (version, dependents)
     pub fn parse_for_duplicates(&self) -> Result<HashMap<String, Vec<CargoPackageInfo>>> {
-        let content = fs::read_to_string(self.lockfile_path).map_err(|e| {
-            miette::miette!("Failed to read Cargo.lock: {}", e)
-        })?;
+        let content = fs::read_to_string(self.lockfile_path)
+            .map_err(|e| miette::miette!("Failed to read Cargo.lock: {}", e))?;
 
-        let lockfile: CargoLockfile = toml::from_str(&content).map_err(|e| {
-            miette::miette!("Failed to parse Cargo.lock: {}", e)
-        })?;
+        let lockfile: CargoLockfile = toml::from_str(&content)
+            .map_err(|e| miette::miette!("Failed to parse Cargo.lock: {}", e))?;
 
         let mut by_name: HashMap<String, Vec<CargoPackageInfo>> = HashMap::new();
 
@@ -136,7 +130,6 @@ impl<'a> CargoLockfileParser<'a> {
                 .push(CargoPackageInfo {
                     version: pkg.version.clone(),
                     dependents: pkg_dependents,
-                    is_path_dep: pkg.source.is_none(),
                 });
         }
 
@@ -149,5 +142,4 @@ impl<'a> CargoLockfileParser<'a> {
 pub struct CargoPackageInfo {
     pub version: String,
     pub dependents: Vec<String>,
-    pub is_path_dep: bool,
 }
