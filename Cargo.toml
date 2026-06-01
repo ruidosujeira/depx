@@ -1,6 +1,6 @@
 [package]
 name = "depx"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Intelligent dependency analyzer for JavaScript/TypeScript and Rust projects"
 license = "MIT"
@@ -9,6 +9,10 @@ homepage = "https://github.com/ruidosujeira/depx"
 readme = "README.md"
 keywords = ["javascript", "typescript", "npm", "cargo", "dependencies"]
 categories = ["command-line-utilities", "development-tools"]
+# The example app and the gif-generation script aren't needed to build or use
+# the crate; keep the published package lean (the demo gif itself stays, so the
+# README renders on crates.io).
+exclude = ["examples", "assets/demo.tape"]
 
 [dependencies]
 # CLI
