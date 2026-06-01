@@ -1,0 +1,16 @@
+{
+  "name": "demo-app",
+  "version": "1.0.0",
+  "description": "Tiny sample project used by depx's demo GIF and docs.",
+  "private": true,
+  "type": "commonjs",
+  "dependencies": {
+    "minimist": "1.2.5",
+    "inflight": "1.0.6",
+    "is-odd": "3.0.1"
+  },
+  "devDependencies": {
+    "typescript": "5.4.5",
+    "@types/node": "20.14.2"
+  }
+}
