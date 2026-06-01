@@ -141,10 +141,30 @@ impl DependencyGraph {
         visited
     }
 
+    /// Resolve a user-supplied query to a node key.
+    ///
+    /// Prefers an exact match (npm keys are bare names, Cargo keys are
+    /// `name@version`), then falls back to a bare crate name, returning the
+    /// lowest matching version when several are installed.
+    fn resolve_key(&self, query: &str) -> Option<String> {
+        if self.packages.contains_key(query) {
+            return Some(query.to_string());
+        }
+
+        let mut matches: Vec<&String> = self
+            .packages
+            .keys()
+            .filter(|key| key.split_once('@').is_some_and(|(name, _)| name == query))
+            .collect();
+        matches.sort();
+        matches.first().map(|key| (*key).clone())
+    }
+
     /// Explain why a package is in the dependency tree
     pub fn explain_package(&self, package_name: &str) -> Option<PackageExplanation> {
-        let pkg = self.packages.get(package_name)?;
-        let pkg_idx = self.node_indices.get(package_name)?;
+        let key = self.resolve_key(package_name)?;
+        let pkg = self.packages.get(&key)?;
+        let pkg_idx = self.node_indices.get(&key)?;
 
         let chains = self.find_dependency_chains(*pkg_idx);
 

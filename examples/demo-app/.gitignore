@@ -1,0 +1,3 @@
+# depx only needs package-lock.json + the source files to analyze this project,
+# never the installed tree. Run `npm install` here if you want to reproduce it.
+node_modules/

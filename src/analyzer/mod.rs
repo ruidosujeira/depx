@@ -61,17 +61,16 @@ impl ImportAnalyzer {
                 continue;
             }
 
-            // Skip test files for production analysis
-            // (we might want to make this configurable later)
-            let is_test = is_test_file(path);
-
-            self.analyze_file(path, is_test, &mut import_map)?;
+            // Test files are scanned too: a package imported only from tests is
+            // still genuinely used, and skipping them would wrongly flag
+            // test-only dependencies as removable.
+            self.analyze_file(path, &mut import_map)?;
         }
 
         Ok(import_map)
     }
 
-    fn analyze_file(&self, path: &Path, _is_test: bool, import_map: &mut ImportMap) -> Result<()> {
+    fn analyze_file(&self, path: &Path, import_map: &mut ImportMap) -> Result<()> {
         let source = std::fs::read_to_string(path)
             .into_diagnostic()
             .with_context(|| format!("Failed to read file: {}", path.display()))?;
@@ -99,21 +98,6 @@ fn is_js_ts_file(path: &Path) -> bool {
         ext,
         "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts"
     )
-}
-
-/// Check if a file is likely a test file
-fn is_test_file(path: &Path) -> bool {
-    let path_str = path.to_string_lossy();
-
-    // Common test file patterns
-    path_str.contains(".test.")
-        || path_str.contains(".spec.")
-        || path_str.contains("__tests__")
-        || path_str.contains("__mocks__")
-        || path_str.ends_with(".test.ts")
-        || path_str.ends_with(".test.js")
-        || path_str.ends_with(".spec.ts")
-        || path_str.ends_with(".spec.js")
 }
 
 /// Extract the package name from an import specifier
