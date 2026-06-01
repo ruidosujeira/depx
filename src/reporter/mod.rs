@@ -44,21 +44,27 @@ impl Reporter {
 
         // Summary
         println!("{}", "Summary".bold());
+        let used = analysis.used.len();
         println!(
-            "  {} packages used",
-            analysis.used.len().to_string().green()
+            "  {} package{} used",
+            used.to_string().green(),
+            plural_s(used)
         );
         if !analysis.unused_direct.is_empty() {
+            let n = analysis.unused_direct.len();
             println!(
-                "  {} packages unused {}",
-                analysis.unused_direct.len().to_string().red(),
+                "  {} package{} unused {}",
+                n.to_string().red(),
+                plural_s(n),
                 "(removable)".red()
             );
         }
         if !analysis.expected_unused_direct.is_empty() {
+            let n = analysis.expected_unused_direct.len();
             println!(
-                "  {} dev/build tools {}",
-                analysis.expected_unused_direct.len().to_string().cyan(),
+                "  {} dev/build tool{} {}",
+                n.to_string().cyan(),
+                plural_s(n),
                 "(expected, not imported)".dimmed()
             );
         }
@@ -359,7 +365,9 @@ impl Reporter {
                 dep.package.version,
                 used_marker
             );
-            println!("    {}", dep.message.dimmed());
+            // Registry deprecation notices can be multi-line and very long;
+            // collapse and cap them so the layout stays intact.
+            println!("    {}", clean_message(&dep.message, 200).dimmed());
         }
 
         println!();
@@ -381,8 +389,9 @@ impl Reporter {
         let stats = &analysis.stats;
         println!("{}", "Summary".bold());
         println!(
-            "  {} crates with multiple versions",
-            stats.total_duplicates.to_string().yellow()
+            "  {} crate{} with multiple versions",
+            stats.total_duplicates.to_string().yellow(),
+            plural_s(stats.total_duplicates)
         );
         if stats.high_severity > 0 {
             println!(
@@ -406,8 +415,9 @@ impl Reporter {
             );
         }
         println!(
-            "  {} extra compile units",
-            stats.extra_compile_units.to_string().cyan()
+            "  {} extra compile unit{}",
+            stats.extra_compile_units.to_string().cyan(),
+            plural_s(stats.extra_compile_units)
         );
         println!();
 
@@ -455,9 +465,10 @@ impl Reporter {
             println!();
         } else if !low.is_empty() {
             println!(
-                "  {} {} low severity duplicates (use --verbose to show)",
+                "  {} {} low severity duplicate{} (use --verbose to show)",
                 "+".dimmed(),
-                low.len()
+                low.len(),
+                plural_s(low.len())
             );
             println!();
         }
@@ -517,5 +528,58 @@ impl Reporter {
 impl Default for Reporter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Returns the plural suffix (`"s"`) unless `count` is exactly one.
+fn plural_s(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// Normalize a registry message for single-line display: collapse runs of
+/// whitespace (including newlines) into single spaces and cap the length with
+/// an ellipsis, so a multi-line or very long notice can't break the layout.
+fn clean_message(message: &str, max_len: usize) -> String {
+    let collapsed = message.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    if collapsed.chars().count() <= max_len {
+        return collapsed;
+    }
+
+    let truncated: String = collapsed.chars().take(max_len.saturating_sub(1)).collect();
+    format!("{}…", truncated.trim_end())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plural_suffix() {
+        assert_eq!(plural_s(0), "s");
+        assert_eq!(plural_s(1), "");
+        assert_eq!(plural_s(2), "s");
+    }
+
+    #[test]
+    fn clean_message_collapses_whitespace() {
+        let msg = "line one\n  line two\t\tline three";
+        assert_eq!(clean_message(msg, 100), "line one line two line three");
+    }
+
+    #[test]
+    fn clean_message_truncates_with_ellipsis() {
+        let out = clean_message("abcdefghij", 5);
+        assert_eq!(out, "abcd…");
+        assert_eq!(out.chars().count(), 5);
+    }
+
+    #[test]
+    fn clean_message_keeps_short_messages() {
+        assert_eq!(clean_message("short and tidy", 100), "short and tidy");
     }
 }
