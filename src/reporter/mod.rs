@@ -203,7 +203,7 @@ impl Reporter {
 
         if explanation.package.is_direct {
             println!(
-                "  {} This is a {} in package.json",
+                "  {} This is a {} declared in the manifest",
                 "->".green(),
                 if explanation.package.is_dev {
                     "dev dependency".yellow()
@@ -242,7 +242,7 @@ impl Reporter {
 
     /// Report vulnerabilities
     #[allow(clippy::type_complexity)]
-    pub fn report_vulnerabilities(&self, vulnerabilities: &[Vulnerability]) {
+    pub fn report_vulnerabilities(&self, vulnerabilities: &[Vulnerability], usage_analyzed: bool) {
         println!();
 
         if vulnerabilities.is_empty() {
@@ -293,7 +293,11 @@ impl Reporter {
 
             println!("{}", color_fn(severity_name));
             for vuln in vulns {
-                let used_marker = if vuln.affects_used_code {
+                // Only annotate usage when an import scan actually ran; without
+                // it every vuln would be labelled "[USED]" without checking.
+                let used_marker = if !usage_analyzed {
+                    String::new()
+                } else if vuln.affects_used_code {
                     " [USED]".red().bold().to_string()
                 } else {
                     " [unused]".dimmed().to_string()

@@ -49,9 +49,9 @@ enum Commands {
         #[arg(long)]
         unused: bool,
 
-        /// Include dev dependencies in analysis
-        #[arg(long, default_value = "true")]
-        include_dev: bool,
+        /// Exclude dev dependencies from analysis (included by default)
+        #[arg(long)]
+        no_dev: bool,
     },
 
     /// Explain why a package is installed
@@ -106,9 +106,9 @@ async fn main() -> Result<()> {
         Commands::Analyze {
             path,
             unused,
-            include_dev,
+            no_dev,
         } => {
-            run_analyze(&path, unused, include_dev).await?;
+            run_analyze(&path, unused, !no_dev).await?;
         }
         Commands::Why { package, path } => {
             run_why(&path, &package).await?;
@@ -138,6 +138,18 @@ async fn run_analyze(path: &Path, show_unused_only: bool, include_dev: bool) -> 
 
     // 1. Parse lockfile to get all installed packages
     let lockfile_parser = LockfileParser::new(path)?;
+
+    // Unused-dependency detection works by scanning JS/TS imports, which is
+    // meaningless for Rust crates. Bail early instead of cross-referencing JS
+    // imports against Cargo packages (that produces nonsense like flagging the
+    // crate itself as removable and suggesting `npm uninstall <crate>`).
+    if lockfile_parser.lockfile_type() == LockfileType::Cargo {
+        miette::bail!(
+            "`analyze` only supports JavaScript/TypeScript projects. \
+             For Rust projects, use `depx duplicates` or `depx audit` instead."
+        );
+    }
+
     let installed_packages = lockfile_parser.parse()?;
 
     reporter.info(&format!(
@@ -216,7 +228,7 @@ async fn run_audit(path: &Path, used_only: bool) -> Result<()> {
         vulnerabilities.retain(|v| v.affects_used_code);
     }
 
-    reporter.report_vulnerabilities(&vulnerabilities);
+    reporter.report_vulnerabilities(&vulnerabilities, used_only);
 
     Ok(())
 }
