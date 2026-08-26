@@ -60,6 +60,7 @@ pub enum EvidenceKind {
     CommonJsRequire,
     DynamicImport,
     ReExport,
+    RustCrateReference,
     PackageScript {
         script: String,
     },

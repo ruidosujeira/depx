@@ -1,0 +1,12 @@
+# yarn lockfile v1
+
+minimist@1.2.5:
+  version "1.2.5"
+
+is-odd@3.0.1:
+  version "3.0.1"
+  dependencies:
+    is-number "^6.0.0"
+
+is-number@^6.0.0:
+  version "6.0.0"

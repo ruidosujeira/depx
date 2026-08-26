@@ -1,5 +1,8 @@
 mod cargo;
+mod javascript;
 mod npm;
+mod pnpm;
+mod yarn;
 
 use std::path::Path;
 
@@ -8,7 +11,10 @@ use miette::{bail, Result};
 use crate::model::{Ecosystem, ProjectSnapshot};
 
 pub use cargo::CargoAdapter;
+pub(crate) use cargo::{cargo_manifest_aliases, cargo_manifest_roots};
 pub use npm::NpmAdapter;
+pub use pnpm::PnpmAdapter;
+pub use yarn::YarnAdapter;
 
 /// Adapter from ecosystem-specific project files to depx's normalized model.
 pub trait EcosystemAdapter {
@@ -22,6 +28,8 @@ pub trait EcosystemAdapter {
 
 static CARGO_ADAPTER: CargoAdapter = CargoAdapter;
 static NPM_ADAPTER: NpmAdapter = NpmAdapter;
+static PNPM_ADAPTER: PnpmAdapter = PnpmAdapter;
+static YARN_ADAPTER: YarnAdapter = YarnAdapter;
 
 /// Detect the supported ecosystem at `root` and return its adapter.
 pub fn detect(root: &Path) -> Result<&'static dyn EcosystemAdapter> {
@@ -29,6 +37,8 @@ pub fn detect(root: &Path) -> Result<&'static dyn EcosystemAdapter> {
     for adapter in [
         &CARGO_ADAPTER as &dyn EcosystemAdapter,
         &NPM_ADAPTER as &dyn EcosystemAdapter,
+        &PNPM_ADAPTER as &dyn EcosystemAdapter,
+        &YARN_ADAPTER as &dyn EcosystemAdapter,
     ] {
         if adapter.detect(root) {
             return Ok(adapter);
@@ -36,14 +46,14 @@ pub fn detect(root: &Path) -> Result<&'static dyn EcosystemAdapter> {
     }
 
     bail!(
-        "No supported lockfile found in {}. Expected Cargo.lock or package-lock.json",
+        "No supported lockfile found in {}. Expected Cargo.lock, package-lock.json, pnpm-lock.yaml or yarn.lock",
         root.display()
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
     use crate::evidence::EvidenceKind;
@@ -100,6 +110,26 @@ mod tests {
     }
 
     #[test]
+    fn npm_workspaces_resolve_member_manifests_without_inventorying_local_packages() {
+        let root = fixture("npm-workspace");
+        let snapshot = NpmAdapter.build_snapshot(&root).unwrap();
+        assert!(!snapshot
+            .components
+            .iter()
+            .any(|component| component.id.name == "app"));
+        let is_odd = snapshot
+            .components
+            .iter()
+            .find(|component| component.id.name == "is-odd")
+            .unwrap();
+        assert!(is_odd.direct);
+        assert!(snapshot.evidence.iter().any(|evidence| {
+            evidence.subject == is_odd.id
+                && evidence.origin.path == Path::new("packages/app/package.json")
+        }));
+    }
+
+    #[test]
     fn cargo_uses_normalized_component_ids_and_resolved_edges() {
         let root = fixture("cargo-normalized");
         let snapshot = CargoAdapter.build_snapshot(&root).unwrap();
@@ -126,6 +156,100 @@ mod tests {
                 && edge.to.name == "transitive"
                 && edge.to.version == "3.0.0"
                 && edge.kind == DependencyKind::Unknown
+        }));
+    }
+
+    #[test]
+    fn cargo_workspaces_resolve_members_inherited_dependencies_and_aliases() {
+        let root = fixture("cargo-workspace");
+        let snapshot = CargoAdapter.build_snapshot(&root).unwrap();
+        let serde = snapshot
+            .components
+            .iter()
+            .find(|component| component.id.name == "serde")
+            .unwrap();
+        let anyhow = snapshot
+            .components
+            .iter()
+            .find(|component| component.id.name == "anyhow")
+            .unwrap();
+        let pretty_assertions = snapshot
+            .components
+            .iter()
+            .find(|component| component.id.name == "pretty_assertions")
+            .unwrap();
+        let yansi = snapshot
+            .components
+            .iter()
+            .find(|component| component.id.name == "yansi")
+            .unwrap();
+
+        assert!(serde.direct);
+        assert!(anyhow.direct);
+        assert!(pretty_assertions.direct);
+        assert!(pretty_assertions.dev);
+        assert!(yansi.direct);
+        assert!(!snapshot
+            .components
+            .iter()
+            .any(|component| { matches!(component.id.name.as_str(), "app" | "tool") }));
+        assert!(snapshot.evidence.iter().any(|evidence| {
+            evidence.subject == anyhow.id
+                && evidence.origin.path == Path::new("crates/app/Cargo.toml")
+        }));
+        assert!(snapshot.evidence.iter().any(|evidence| {
+            evidence.subject == yansi.id
+                && evidence.origin.path == Path::new("internal/shared/Cargo.toml")
+        }));
+    }
+
+    #[test]
+    fn pnpm_workspaces_preserve_direct_declarations_and_edges() {
+        let root = fixture("pnpm-workspace");
+        let snapshot = PnpmAdapter.build_snapshot(&root).unwrap();
+        let minimist = snapshot
+            .components
+            .iter()
+            .find(|component| component.id.name == "minimist")
+            .unwrap();
+        let is_odd = snapshot
+            .components
+            .iter()
+            .find(|component| component.id.name == "is-odd")
+            .unwrap();
+        assert!(minimist.direct);
+        assert!(is_odd.direct);
+        assert!(snapshot.evidence.iter().any(|evidence| {
+            evidence.subject == is_odd.id
+                && evidence.origin.path == Path::new("packages/app/package.json")
+        }));
+        assert!(snapshot.dependency_edges.iter().any(|edge| {
+            edge.from == is_odd.id && edge.to.name == "is-number" && edge.to.version == "6.0.0"
+        }));
+    }
+
+    #[test]
+    fn yarn_workspaces_preserve_direct_declarations_and_edges() {
+        let root = fixture("yarn-workspace");
+        let snapshot = YarnAdapter.build_snapshot(&root).unwrap();
+        let minimist = snapshot
+            .components
+            .iter()
+            .find(|component| component.id.name == "minimist")
+            .unwrap();
+        let is_odd = snapshot
+            .components
+            .iter()
+            .find(|component| component.id.name == "is-odd")
+            .unwrap();
+        assert!(minimist.direct);
+        assert!(is_odd.direct);
+        assert!(snapshot.evidence.iter().any(|evidence| {
+            evidence.subject == is_odd.id
+                && evidence.origin.path == Path::new("packages/app/package.json")
+        }));
+        assert!(snapshot.dependency_edges.iter().any(|edge| {
+            edge.from == is_odd.id && edge.to.name == "is-number" && edge.to.version == "6.0.0"
         }));
     }
 

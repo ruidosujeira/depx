@@ -1,6 +1,6 @@
 [package]
 name = "depx"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Intelligent dependency analyzer for JavaScript/TypeScript and Rust projects"
 license = "MIT"
@@ -27,6 +27,7 @@ oxc_ast = "0.44"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml_ng = "0.10"
 toml = "0.8"
 
 # Error handling & diagnostics
@@ -38,6 +39,7 @@ reqwest = { version = "0.12", features = ["json"] }
 
 # Utilities
 ignore = "0.4"
+globset = "0.4"
 petgraph = "0.6"
 semver = "1"
 colored = "2"

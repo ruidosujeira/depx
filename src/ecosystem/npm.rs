@@ -9,6 +9,7 @@ use crate::model::{
     Component, ComponentId, DependencyEdge, DependencyKind, Ecosystem, ProjectSnapshot,
 };
 
+use super::javascript::{read_manifests, ManifestRecord};
 use super::EcosystemAdapter;
 
 /// Adapter for npm `package-lock.json` projects.
@@ -31,52 +32,25 @@ impl EcosystemAdapter for NpmAdapter {
         let lockfile: NpmLockfile = serde_json::from_str(&content)
             .into_diagnostic()
             .wrap_err("Failed to parse package-lock.json")?;
-        let manifest = read_manifest(root)?;
+        let manifests = read_manifests(root, &[])?;
 
         if !lockfile.packages.is_empty() {
-            build_v2_snapshot(root, lockfile, manifest)
+            build_v2_snapshot(root, lockfile, manifests)
         } else {
-            build_v1_snapshot(root, lockfile, manifest)
+            build_v1_snapshot(root, lockfile, manifests)
         }
     }
-}
-
-fn read_manifest(root: &Path) -> Result<PackageJson> {
-    let path = root.join("package.json");
-    if !path.exists() {
-        return Ok(PackageJson::default());
-    }
-    let content = std::fs::read_to_string(&path)
-        .into_diagnostic()
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    serde_json::from_str(&content)
-        .into_diagnostic()
-        .wrap_err("Failed to parse package.json")
 }
 
 fn build_v2_snapshot(
     root: &Path,
     lockfile: NpmLockfile,
-    manifest: PackageJson,
+    manifests: Vec<ManifestRecord>,
 ) -> Result<ProjectSnapshot> {
-    let direct: HashSet<&str> = manifest
-        .dependencies
-        .keys()
-        .chain(manifest.dev_dependencies.keys())
-        .chain(manifest.optional_dependencies.keys())
-        .chain(manifest.peer_dependencies.keys())
-        .map(String::as_str)
-        .collect();
-    let dev: HashSet<&str> = manifest
-        .dev_dependencies
-        .keys()
-        .map(String::as_str)
-        .collect();
-
-    let mut components = Vec::new();
     let mut ids_by_location = HashMap::new();
     for (location, info) in &lockfile.packages {
-        if location.is_empty() {
+        if location.is_empty() || !location.contains("node_modules/") || info.link.unwrap_or(false)
+        {
             continue;
         }
         let name = extract_package_name_from_path(location);
@@ -89,15 +63,33 @@ fn build_v2_snapshot(
             version: info.version.clone().unwrap_or_default(),
             location: Some(location.clone()),
         };
-        let is_top_level = location.as_str() == format!("node_modules/{name}");
-        components.push(Component {
-            id: id.clone(),
-            direct: is_top_level && direct.contains(name.as_str()),
-            dev: info.dev.unwrap_or(false) || (is_top_level && dev.contains(name.as_str())),
-            deprecated: info.deprecated.clone(),
-        });
         ids_by_location.insert(location.clone(), id);
     }
+    let declarations = resolve_manifest_declarations(&manifests, &ids_by_location);
+    let direct_ids: HashSet<_> = declarations.iter().map(|item| item.id.clone()).collect();
+    let runtime_ids: HashSet<_> = declarations
+        .iter()
+        .filter(|item| !item.dev)
+        .map(|item| item.id.clone())
+        .collect();
+    let components: Vec<_> = lockfile
+        .packages
+        .iter()
+        .filter_map(|(location, info)| {
+            let id = ids_by_location.get(location)?.clone();
+            let direct = direct_ids.contains(&id);
+            Some(Component {
+                id,
+                direct,
+                dev: if direct {
+                    !runtime_ids.contains(ids_by_location.get(location)?)
+                } else {
+                    info.dev.unwrap_or(false)
+                },
+                deprecated: info.deprecated.clone(),
+            })
+        })
+        .collect();
 
     let mut edges = Vec::new();
     for (location, info) in &lockfile.packages {
@@ -123,49 +115,51 @@ fn build_v2_snapshot(
         }
     }
 
-    build_snapshot_with_evidence(root, components, edges, &manifest)
+    build_snapshot_with_evidence(root, components, edges, declarations)
 }
 
 fn build_v1_snapshot(
     root: &Path,
     lockfile: NpmLockfile,
-    manifest: PackageJson,
+    manifests: Vec<ManifestRecord>,
 ) -> Result<ProjectSnapshot> {
-    let direct: HashSet<&str> = manifest
-        .dependencies
-        .keys()
-        .chain(manifest.dev_dependencies.keys())
-        .chain(manifest.optional_dependencies.keys())
-        .chain(manifest.peer_dependencies.keys())
-        .map(String::as_str)
-        .collect();
-    let dev: HashSet<&str> = manifest
-        .dev_dependencies
-        .keys()
-        .map(String::as_str)
-        .collect();
     let mut records = Vec::new();
     collect_v1_records(&lockfile.dependencies, "", &mut records);
 
-    let mut components = Vec::new();
     let mut ids_by_location = HashMap::new();
     for record in &records {
-        let is_top_level = record.location == format!("node_modules/{}", record.name);
         let id = ComponentId {
             ecosystem: Ecosystem::Npm,
             name: record.name.clone(),
             version: record.dependency.version.clone(),
             location: Some(record.location.clone()),
         };
-        components.push(Component {
-            id: id.clone(),
-            direct: is_top_level && direct.contains(record.name.as_str()),
-            dev: record.dependency.dev.unwrap_or(false)
-                || (is_top_level && dev.contains(record.name.as_str())),
-            deprecated: None,
-        });
         ids_by_location.insert(record.location.clone(), id);
     }
+    let declarations = resolve_manifest_declarations(&manifests, &ids_by_location);
+    let direct_ids: HashSet<_> = declarations.iter().map(|item| item.id.clone()).collect();
+    let runtime_ids: HashSet<_> = declarations
+        .iter()
+        .filter(|item| !item.dev)
+        .map(|item| item.id.clone())
+        .collect();
+    let components: Vec<_> = records
+        .iter()
+        .filter_map(|record| {
+            let id = ids_by_location.get(&record.location)?.clone();
+            let direct = direct_ids.contains(&id);
+            Some(Component {
+                id,
+                direct,
+                dev: if direct {
+                    !runtime_ids.contains(ids_by_location.get(&record.location)?)
+                } else {
+                    record.dependency.dev.unwrap_or(false)
+                },
+                deprecated: None,
+            })
+        })
+        .collect();
 
     let mut edges = Vec::new();
     for record in records {
@@ -183,24 +177,59 @@ fn build_v1_snapshot(
         }
     }
 
-    build_snapshot_with_evidence(root, components, edges, &manifest)
+    build_snapshot_with_evidence(root, components, edges, declarations)
+}
+
+struct ResolvedDeclaration {
+    id: ComponentId,
+    path: std::path::PathBuf,
+    section: ManifestSection,
+    dev: bool,
+}
+
+fn resolve_manifest_declarations(
+    manifests: &[ManifestRecord],
+    ids_by_location: &HashMap<String, ComponentId>,
+) -> Vec<ResolvedDeclaration> {
+    let mut declarations = Vec::new();
+    for record in manifests {
+        let from = record.directory.to_string_lossy().replace('\\', "/");
+        for declaration in record.manifest.declarations() {
+            if let Some(id) = resolve_npm_dependency(&from, &declaration.name, ids_by_location) {
+                declarations.push(ResolvedDeclaration {
+                    id: id.clone(),
+                    path: record.path.clone(),
+                    section: declaration.section,
+                    dev: declaration.dev,
+                });
+            }
+        }
+    }
+    declarations.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.section.cmp(&right.section))
+    });
+    declarations.dedup_by(|left, right| {
+        left.id == right.id && left.path == right.path && left.section == right.section
+    });
+    declarations
 }
 
 fn build_snapshot_with_evidence(
     root: &Path,
     components: Vec<Component>,
     edges: Vec<DependencyEdge>,
-    manifest: &PackageJson,
+    declarations: Vec<ResolvedDeclaration>,
 ) -> Result<ProjectSnapshot> {
     let mut evidence = Vec::new();
-    for component in components.iter().filter(|component| component.direct) {
-        for section in manifest.sections_for(&component.id.name) {
-            evidence.push(manifest_evidence(
-                component.id.clone(),
-                "package.json".into(),
-                section,
-            )?);
-        }
+    for declaration in declarations {
+        evidence.push(manifest_evidence(
+            declaration.id,
+            declaration.path,
+            declaration.section,
+        )?);
     }
     evidence.extend(transitive_evidence(&edges, "package-lock.json".into())?);
     ProjectSnapshot::new(root.to_path_buf(), components, edges).with_evidence(evidence)
@@ -240,7 +269,11 @@ fn resolve_npm_dependency<'a>(
 ) -> Option<&'a ComponentId> {
     let mut base = Some(from_location);
     while let Some(path) = base {
-        let candidate = format!("{path}/node_modules/{dependency_name}");
+        let candidate = if path.is_empty() {
+            format!("node_modules/{dependency_name}")
+        } else {
+            format!("{path}/node_modules/{dependency_name}")
+        };
         if let Some(id) = ids_by_location.get(&candidate) {
             return Some(id);
         }
@@ -283,6 +316,7 @@ struct NpmLockfile {
 #[serde(rename_all = "camelCase")]
 struct NpmPackageInfo {
     version: Option<String>,
+    link: Option<bool>,
     dev: Option<bool>,
     #[serde(default)]
     dependencies: HashMap<String, String>,
@@ -299,37 +333,6 @@ struct NpmDependency {
     requires: HashMap<String, String>,
     #[serde(default)]
     dependencies: HashMap<String, NpmDependency>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct PackageJson {
-    #[serde(default)]
-    dependencies: HashMap<String, String>,
-    #[serde(default)]
-    dev_dependencies: HashMap<String, String>,
-    #[serde(default)]
-    optional_dependencies: HashMap<String, String>,
-    #[serde(default)]
-    peer_dependencies: HashMap<String, String>,
-}
-
-impl PackageJson {
-    fn sections_for(&self, name: &str) -> Vec<ManifestSection> {
-        let tables = [
-            (&self.dependencies, ManifestSection::Dependencies),
-            (&self.dev_dependencies, ManifestSection::DevDependencies),
-            (
-                &self.optional_dependencies,
-                ManifestSection::OptionalDependencies,
-            ),
-            (&self.peer_dependencies, ManifestSection::PeerDependencies),
-        ];
-        tables
-            .into_iter()
-            .filter_map(|(table, section)| table.contains_key(name).then_some(section))
-            .collect()
-    }
 }
 
 #[cfg(test)]

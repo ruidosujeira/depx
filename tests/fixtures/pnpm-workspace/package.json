@@ -1,0 +1,8 @@
+{
+  "name": "pnpm-workspace-fixture",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "minimist": "1.2.5"
+  }
+}

@@ -92,14 +92,20 @@ impl DependencyGraph {
     /// Explain both presence and evidence-derived participation.
     pub fn explain_package(&self, query: &str) -> Result<PackageExplanation, ExplainError> {
         let id = self.resolve_query(query)?;
+        self.explain_component(&id)
+    }
+
+    /// Explain an already-resolved component without going through the lossy
+    /// name/version CLI query layer.
+    pub fn explain_component(&self, id: &ComponentId) -> Result<PackageExplanation, ExplainError> {
         let component = self
             .components
-            .get(&id)
-            .ok_or_else(|| ExplainError::NotFound(query.to_string()))?;
+            .get(id)
+            .ok_or_else(|| ExplainError::NotFound(id.to_string()))?;
         let component_index = self
             .node_indices
-            .get(&id)
-            .ok_or_else(|| ExplainError::NotFound(query.to_string()))?;
+            .get(id)
+            .ok_or_else(|| ExplainError::NotFound(id.to_string()))?;
         let chains = self.find_dependency_chains(*component_index);
         Ok(PackageExplanation {
             package: component.clone(),
@@ -107,18 +113,18 @@ impl DependencyGraph {
             evidence: self
                 .evidence
                 .iter()
-                .filter(|evidence| evidence.subject == id)
+                .filter(|evidence| evidence.subject == *id)
                 .cloned()
                 .collect(),
             assessment: self
                 .assessments
-                .get(&id)
+                .get(id)
                 .cloned()
-                .ok_or_else(|| ExplainError::NotFound(query.to_string()))?,
+                .ok_or_else(|| ExplainError::NotFound(id.to_string()))?,
             findings: self
                 .findings
                 .iter()
-                .filter(|finding| finding.subject == id)
+                .filter(|finding| finding.subject == *id)
                 .cloned()
                 .collect(),
         })

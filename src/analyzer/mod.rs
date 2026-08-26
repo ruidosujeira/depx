@@ -1,4 +1,5 @@
 mod extractor;
+mod rust;
 
 use std::path::{Path, PathBuf};
 
@@ -8,6 +9,7 @@ use miette::{Context, IntoDiagnostic, Result};
 use crate::types::ImportMap;
 
 pub use extractor::ImportExtractor;
+pub use rust::{RustAnalyzer, RustReference};
 
 /// Analyzes JavaScript/TypeScript source files to extract imports
 pub struct ImportAnalyzer {

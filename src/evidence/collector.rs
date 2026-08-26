@@ -6,7 +6,8 @@ use miette::{Context, IntoDiagnostic, Result};
 use serde::Deserialize;
 
 use crate::analysis::{AnalysisCoverage, CoverageArea, CoverageLimitation};
-use crate::analyzer::ImportAnalyzer;
+use crate::analyzer::{ImportAnalyzer, RustAnalyzer, RustReference};
+use crate::ecosystem::{cargo_manifest_aliases, cargo_manifest_roots};
 use crate::model::{Component, ComponentId, DependencyEdge, Ecosystem, ProjectSnapshot};
 use crate::types::{Import, ImportKind};
 
@@ -31,7 +32,21 @@ pub fn collect_project_evidence(snapshot: ProjectSnapshot) -> Result<EvidenceCol
     let ecosystem = snapshot
         .components
         .first()
-        .map(|component| component.id.ecosystem);
+        .map(|component| component.id.ecosystem)
+        .or_else(|| {
+            snapshot
+                .root
+                .join("package-lock.json")
+                .is_file()
+                .then_some(Ecosystem::Npm)
+        })
+        .or_else(|| {
+            snapshot
+                .root
+                .join("Cargo.lock")
+                .is_file()
+                .then_some(Ecosystem::Cargo)
+        });
     let mut evidence = Vec::new();
     let (source_references, files_analyzed, coverage) = if ecosystem == Some(Ecosystem::Npm) {
         let imports = ImportAnalyzer::new(&snapshot.root).analyze()?;
@@ -66,18 +81,37 @@ pub fn collect_project_evidence(snapshot: ProjectSnapshot) -> Result<EvidenceCol
                 limitations,
             ),
         )
-    } else {
+    } else if ecosystem == Some(Ecosystem::Cargo) {
+        let project_roots = cargo_manifest_roots(&snapshot.root)?;
+        let references = RustAnalyzer::new(&snapshot.root)
+            .with_allowed_project_roots(project_roots)
+            .analyze()?;
+        let (source_evidence, unresolved_references) =
+            collect_rust_source(&snapshot, references.references())?;
+        evidence.extend(source_evidence);
+        let mut limitations = vec![
+            CoverageLimitation::RustConditionalCompilation,
+            CoverageLimitation::RustMacroExpansion,
+            CoverageLimitation::GeneratedSourceCode,
+        ];
+        if unresolved_references {
+            limitations.push(CoverageLimitation::UnresolvedPackageReferences);
+        }
         (
-            0,
-            0,
+            references.total_references(),
+            references.files_analyzed(),
             AnalysisCoverage::new(
                 vec![
                     CoverageArea::ManifestDeclarations,
                     CoverageArea::DependencyGraph,
+                    CoverageArea::RustCrateReferences,
+                    CoverageArea::TestFiles,
                 ],
-                vec![CoverageLimitation::RustSourceUsage],
+                limitations,
             ),
         )
+    } else {
+        (0, 0, AnalysisCoverage::new(Vec::new(), Vec::new()))
     };
     let snapshot = snapshot.with_evidence(evidence)?;
     Ok(EvidenceCollection {
@@ -86,6 +120,63 @@ pub fn collect_project_evidence(snapshot: ProjectSnapshot) -> Result<EvidenceCol
         source_references,
         files_analyzed,
     })
+}
+
+fn collect_rust_source<'a>(
+    snapshot: &ProjectSnapshot,
+    references: impl Iterator<Item = &'a RustReference>,
+) -> Result<(Vec<Evidence>, bool)> {
+    let aliases = cargo_manifest_aliases(&snapshot.root)?;
+    let mut evidence = Vec::new();
+    let mut unresolved = false;
+    for reference in references {
+        let Some(package_name) = aliases.get(&reference.identifier) else {
+            continue;
+        };
+        let candidates = resolve_candidates(&snapshot.components, package_name);
+        if candidates.is_empty() {
+            unresolved = true;
+            continue;
+        }
+        let relative = relative_path(&snapshot.root, &reference.file_path);
+        let role = classify_rust_source_role(&relative);
+        evidence.extend(evidence_for_candidates(
+            candidates,
+            EvidenceKind::RustCrateReference,
+            EvidenceOrigin {
+                path: relative,
+                span: Some(reference.span),
+                description: Some(format!(
+                    "references Rust crate identifier {}",
+                    reference.identifier
+                )),
+            },
+            role,
+            // This collector resolves syntax without executing cfg expansion or
+            // macros, so retain medium confidence even for a unique component.
+            Confidence::Medium,
+        )?);
+    }
+    Ok((evidence, unresolved))
+}
+
+fn classify_rust_source_role(path: &Path) -> SourceRole {
+    if path.file_name().and_then(|name| name.to_str()) == Some("build.rs") {
+        return SourceRole::Build;
+    }
+    if path
+        .components()
+        .any(|component| matches!(component.as_os_str().to_str(), Some("tests" | "benches")))
+    {
+        return SourceRole::Test;
+    }
+    if path
+        .components()
+        .any(|component| component.as_os_str().to_str() == Some("examples"))
+    {
+        return SourceRole::Development;
+    }
+    SourceRole::Runtime
 }
 
 fn collect_source<'a>(
@@ -334,11 +425,19 @@ pub(crate) fn transitive_evidence(
 mod tests {
     use super::*;
     use crate::analysis::{assess_usage, UsageState};
-    use crate::ecosystem::{EcosystemAdapter, NpmAdapter};
+    use crate::ecosystem::{CargoAdapter, EcosystemAdapter, NpmAdapter};
     use crate::model::{Component, Ecosystem};
 
     fn fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/npm-evidence")
+    }
+
+    fn cargo_fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cargo-normalized")
+    }
+
+    fn cargo_workspace_fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cargo-workspace")
     }
 
     fn collected() -> EvidenceCollection {
@@ -495,5 +594,76 @@ mod tests {
             serde_json::to_string(&assess_usage(&first.snapshot).unwrap()).unwrap(),
             serde_json::to_string(&assess_usage(&second.snapshot).unwrap()).unwrap()
         );
+    }
+
+    #[test]
+    fn rust_crate_references_are_role_aware_usage_evidence() {
+        let snapshot = CargoAdapter.build_snapshot(&cargo_fixture()).unwrap();
+        let collection = collect_project_evidence(snapshot).unwrap();
+        assert!(collection
+            .coverage
+            .checked
+            .contains(&CoverageArea::RustCrateReferences));
+        assert!(collection.snapshot.evidence.iter().any(|evidence| {
+            evidence.subject.name == "foo"
+                && evidence.kind == EvidenceKind::RustCrateReference
+                && evidence.role == SourceRole::Runtime
+                && evidence.origin.span.is_some()
+        }));
+        assert!(collection.snapshot.evidence.iter().any(|evidence| {
+            evidence.subject.name == "test-helper"
+                && evidence.kind == EvidenceKind::RustCrateReference
+                && evidence.role == SourceRole::Test
+        }));
+
+        let assessments = assess_usage(&collection.snapshot).unwrap();
+        assert_eq!(
+            assessments
+                .iter()
+                .find(|assessment| assessment.component.name == "foo"
+                    && assessment.component.version == "2.0.0")
+                .unwrap()
+                .state,
+            UsageState::ConfirmedRuntime
+        );
+        assert_eq!(
+            assessments
+                .iter()
+                .find(|assessment| assessment.component.name == "test-helper")
+                .unwrap()
+                .state,
+            UsageState::ConfirmedTest
+        );
+    }
+
+    #[test]
+    fn rust_workspace_source_references_resolve_member_aliases() {
+        let snapshot = CargoAdapter
+            .build_snapshot(&cargo_workspace_fixture())
+            .unwrap();
+        let collection = collect_project_evidence(snapshot).unwrap();
+        assert!(collection.snapshot.evidence.iter().any(|evidence| {
+            evidence.subject.name == "anyhow"
+                && evidence.kind == EvidenceKind::RustCrateReference
+                && evidence.origin.path == Path::new("crates/app/src/lib.rs")
+        }));
+        assert!(collection.snapshot.evidence.iter().any(|evidence| {
+            evidence.subject.name == "pretty_assertions"
+                && evidence.kind == EvidenceKind::RustCrateReference
+                && evidence.role == SourceRole::Test
+        }));
+        assert!(collection.snapshot.evidence.iter().any(|evidence| {
+            evidence.subject.name == "yansi"
+                && evidence.kind == EvidenceKind::RustCrateReference
+                && evidence.origin.path == Path::new("internal/shared/src/lib.rs")
+        }));
+        assert!(!collection.snapshot.evidence.iter().any(|evidence| {
+            evidence.kind == EvidenceKind::RustCrateReference
+                && evidence.origin.path.starts_with("nested-fixture")
+        }));
+        assert!(!collection
+            .coverage
+            .not_checked
+            .contains(&CoverageLimitation::UnresolvedPackageReferences));
     }
 }

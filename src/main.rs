@@ -7,6 +7,8 @@ mod finding;
 mod graph;
 mod model;
 mod output;
+mod plan;
+mod policy;
 mod query;
 mod reporter;
 mod types;
@@ -24,6 +26,7 @@ use crate::evidence::{collect_project_evidence, EvidenceKind, EvidenceResolution
 use crate::finding::analyze_project;
 use crate::graph::DependencyGraph;
 use crate::model::{Ecosystem, ProjectSnapshot};
+use crate::policy::{FindingFailOn, Policy};
 use crate::reporter::Reporter;
 use crate::types::Severity;
 
@@ -40,9 +43,13 @@ fn osv_ecosystem(ecosystem: Ecosystem) -> &'static str {
 #[command(
     author,
     version,
-    about = "Intelligent dependency analyzer for JS/TS projects"
+    about = "Evidence-backed dependency decisions for JavaScript/TypeScript and Rust"
 )]
 struct Cli {
+    /// Path to depx.toml (defaults to depx.toml in the project root)
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -92,8 +99,16 @@ enum Commands {
         no_dev: bool,
 
         /// Emit deterministic machine-readable JSON
-        #[arg(long)]
+        #[arg(long, conflicts_with = "sarif")]
         json: bool,
+
+        /// Emit SARIF 2.1.0 for code-scanning integrations
+        #[arg(long, conflicts_with = "json")]
+        sarif: bool,
+
+        /// Exit with code 1 when a finding meets this severity threshold
+        #[arg(long, value_enum)]
+        fail_on: Option<FindingFailOn>,
 
         /// Show complete finding evidence in text output
         #[arg(short, long)]
@@ -132,6 +147,32 @@ enum Commands {
         path: PathBuf,
     },
 
+    /// Build a prioritized, evidence-backed remediation plan
+    Plan {
+        /// Path to the project root
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Emit deterministic machine-readable JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Show dependency chains for every proposed action
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
+    /// Save current finding identities so CI reports only new findings
+    Baseline {
+        /// Path to the project root
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Baseline file to create, relative to the project root
+        #[arg(short, long, default_value = "depx-baseline.json")]
+        output: PathBuf,
+    },
+
     /// Detect duplicate dependencies (multiple versions of same crate)
     Duplicates {
         /// Path to the project root
@@ -161,6 +202,7 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
+    let config = cli.config;
 
     let exit_code = match cli.command {
         Commands::Analyze {
@@ -168,13 +210,31 @@ async fn run() -> Result<ExitCode> {
             unused,
             no_dev,
             json,
+            sarif,
+            fail_on,
             verbose,
         } => {
-            run_analyze(&path, unused, !no_dev, json, verbose).await?;
-            ExitCode::SUCCESS
+            if run_analyze(
+                &path,
+                AnalyzeOptions {
+                    show_unused_only: unused,
+                    include_dev: !no_dev,
+                    json,
+                    sarif,
+                    verbose,
+                    fail_on,
+                    config_path: config.as_deref(),
+                },
+            )
+            .await?
+            {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Commands::Why { package, path } => {
-            run_why(&path, &package).await?;
+            run_why(&path, &package, config.as_deref()).await?;
             ExitCode::SUCCESS
         }
         Commands::Audit {
@@ -192,6 +252,18 @@ async fn run() -> Result<ExitCode> {
             run_deprecated(&path).await?;
             ExitCode::SUCCESS
         }
+        Commands::Plan {
+            path,
+            json,
+            verbose,
+        } => {
+            run_plan(&path, json, verbose, config.as_deref()).await?;
+            ExitCode::SUCCESS
+        }
+        Commands::Baseline { path, output } => {
+            run_baseline(&path, &output, config.as_deref()).await?;
+            ExitCode::SUCCESS
+        }
         Commands::Duplicates {
             path,
             verbose,
@@ -205,35 +277,32 @@ async fn run() -> Result<ExitCode> {
     Ok(exit_code)
 }
 
-async fn run_analyze(
-    path: &Path,
+struct AnalyzeOptions<'a> {
     show_unused_only: bool,
     include_dev: bool,
     json: bool,
+    sarif: bool,
     verbose: bool,
-) -> Result<()> {
-    let reporter = if verbose {
+    fail_on: Option<FindingFailOn>,
+    config_path: Option<&'a Path>,
+}
+
+async fn run_analyze(path: &Path, options: AnalyzeOptions<'_>) -> Result<bool> {
+    let reporter = if options.verbose {
         Reporter::new().verbose()
     } else {
         Reporter::new()
     };
-    if !json {
+    let machine_output = options.json || options.sarif;
+    if !machine_output {
         reporter.status("Analyzing", &format!("project at {}", path.display()));
     }
 
     // 1. Build the normalized component inventory and resolved edge set.
     let adapter = ecosystem::detect(path)?;
 
-    // This phase's source, script and configuration collectors target JS/TS.
-    if adapter.ecosystem() == Ecosystem::Cargo {
-        miette::bail!(
-            "`analyze` only supports JavaScript/TypeScript projects. \
-             For Rust projects, use `depx duplicates` or `depx audit` instead."
-        );
-    }
-
     let snapshot = adapter.build_snapshot(path)?;
-    let snapshot = if include_dev {
+    let snapshot = if options.include_dev {
         snapshot
     } else {
         without_dev_components(snapshot)?
@@ -242,36 +311,42 @@ async fn run_analyze(
 
     let source_references = collection.source_references;
     let files_analyzed = collection.files_analyzed;
-    let analysis = analyze_project(collection.snapshot, collection.coverage)?;
-    if json {
+    let mut analysis = analyze_project(collection.snapshot, collection.coverage)?;
+    let policy = Policy::load(path, options.config_path)?;
+    let policy_application = policy.apply(&mut analysis);
+    report_policy_warnings(&policy_application);
+    if options.json {
         println!("{}", output::serialize_analysis(&analysis)?);
-        return Ok(());
+    } else if options.sarif {
+        println!("{}", output::serialize_sarif(&analysis)?);
+    } else {
+        reporter.info(&format!(
+            "Found {} installed packages",
+            analysis.snapshot.components.len()
+        ));
+        reporter.info(&format!(
+            "Collected {source_references} source references across {files_analyzed} files"
+        ));
+        report_policy_application(&reporter, &policy_application);
+        reporter.report_findings(&analysis, options.show_unused_only);
+        reporter.report_analysis(
+            &analysis.snapshot,
+            &analysis.assessments,
+            &analysis.coverage,
+            options.show_unused_only,
+            options.include_dev,
+        );
     }
-    reporter.info(&format!(
-        "Found {} installed packages",
-        analysis.snapshot.components.len()
-    ));
-    reporter.info(&format!(
-        "Collected {source_references} source references across {files_analyzed} files"
-    ));
-    reporter.report_findings(&analysis, show_unused_only);
-    reporter.report_analysis(
-        &analysis.snapshot,
-        &analysis.assessments,
-        &analysis.coverage,
-        show_unused_only,
-        include_dev,
-    );
-
-    Ok(())
+    Ok(policy.should_fail(&analysis.findings, options.fail_on))
 }
 
-async fn run_why(path: &Path, package: &str) -> Result<()> {
+async fn run_why(path: &Path, package: &str, config_path: Option<&Path>) -> Result<()> {
     let reporter = Reporter::new();
 
     let snapshot = ecosystem::detect(path)?.build_snapshot(path)?;
     let collection = collect_project_evidence(snapshot)?;
-    let analysis = analyze_project(collection.snapshot, collection.coverage)?;
+    let mut analysis = analyze_project(collection.snapshot, collection.coverage)?;
+    Policy::load(path, config_path)?.apply(&mut analysis);
     let graph = DependencyGraph::from_analysis(&analysis)?;
 
     match graph.explain_package(package) {
@@ -288,11 +363,6 @@ async fn run_audit(path: &Path, used_only: bool, fail_on: AuditFailOn) -> Result
     reporter.status("Auditing", &format!("project at {}", path.display()));
 
     let adapter = ecosystem::detect(path)?;
-    if used_only && adapter.ecosystem() == Ecosystem::Cargo {
-        miette::bail!(
-            "`audit --used-only` is unavailable for Rust projects because Rust source usage is not yet collected"
-        );
-    }
     let osv_ecosystem = osv_ecosystem(adapter.ecosystem());
     let snapshot = adapter.build_snapshot(path)?;
 
@@ -340,6 +410,93 @@ async fn run_deprecated(path: &Path) -> Result<()> {
     reporter.report_deprecated(&deprecated);
 
     Ok(())
+}
+
+async fn run_plan(
+    path: &Path,
+    json: bool,
+    verbose: bool,
+    config_path: Option<&Path>,
+) -> Result<()> {
+    let reporter = if verbose {
+        Reporter::new().verbose()
+    } else {
+        Reporter::new()
+    };
+    if !json {
+        reporter.status(
+            "Planning",
+            &format!("dependency decisions at {}", path.display()),
+        );
+    }
+
+    let adapter = ecosystem::detect(path)?;
+    let osv_ecosystem = osv_ecosystem(adapter.ecosystem());
+    let snapshot = adapter.build_snapshot(path)?;
+    let collection = collect_project_evidence(snapshot)?;
+    let mut analysis = analyze_project(collection.snapshot, collection.coverage)?;
+    let policy = Policy::load(path, config_path)?;
+    let policy_application = policy.apply(&mut analysis);
+    report_policy_warnings(&policy_application);
+    let used = used_component_ids(&analysis.snapshot, &analysis.assessments)?;
+    let vulnerabilities = vulnerability::check_vulnerabilities(
+        &analysis.snapshot.components,
+        Some(&used),
+        osv_ecosystem,
+    )
+    .await?;
+    let deprecated =
+        vulnerability::check_deprecated(&analysis.snapshot.components, Some(&used)).await?;
+    let plan = plan::build_plan(&analysis, &vulnerabilities, &deprecated)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&plan).map_err(|error| miette::miette!(
+                "Failed to serialize remediation plan: {error}"
+            ))?
+        );
+    } else {
+        report_policy_application(&reporter, &policy_application);
+        reporter.report_plan(&plan);
+    }
+    Ok(())
+}
+
+async fn run_baseline(path: &Path, output: &Path, config_path: Option<&Path>) -> Result<()> {
+    let reporter = Reporter::new();
+    reporter.status(
+        "Baselining",
+        &format!("current findings at {}", path.display()),
+    );
+    let snapshot = ecosystem::detect(path)?.build_snapshot(path)?;
+    let collection = collect_project_evidence(snapshot)?;
+    let mut analysis = analyze_project(collection.snapshot, collection.coverage)?;
+    let policy = Policy::load(path, config_path)?;
+    let ignored = policy.apply_ignores(&mut analysis);
+    let count = analysis.findings.len();
+    let output = policy.write_baseline(&analysis, output)?;
+    reporter.info(&format!(
+        "Saved {count} finding identities to {} ({ignored} ignored by policy)",
+        output.display()
+    ));
+    Ok(())
+}
+
+fn report_policy_application(reporter: &Reporter, application: &policy::PolicyApplication) {
+    let suppressed = application.ignored_findings + application.baseline_findings;
+    if suppressed > 0 {
+        reporter.info(&format!(
+            "Suppressed {suppressed} existing findings ({} policy, {} baseline)",
+            application.ignored_findings, application.baseline_findings
+        ));
+    }
+}
+
+fn report_policy_warnings(application: &policy::PolicyApplication) {
+    for exception in &application.expired_exceptions {
+        eprintln!("     Warning policy exception {exception}; it no longer suppresses findings");
+    }
 }
 
 async fn run_duplicates(path: &Path, verbose: bool, json: bool) -> Result<()> {

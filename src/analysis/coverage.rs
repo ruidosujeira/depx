@@ -10,6 +10,7 @@ pub enum CoverageArea {
     CommonJsRequires,
     DynamicImports,
     ReExports,
+    RustCrateReferences,
     PackageScripts,
     SupportedConfigurationFiles,
     TestFiles,
@@ -25,7 +26,9 @@ pub enum CoverageLimitation {
     UnsupportedConfigurationFormats,
     PackageBinaryAliases,
     UnresolvedPackageReferences,
-    RustSourceUsage,
+    RustConditionalCompilation,
+    RustMacroExpansion,
+    GeneratedSourceCode,
 }
 
 /// Explicit account of inspected and unsupported analysis surfaces.

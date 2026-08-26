@@ -51,6 +51,10 @@ pub fn metadata(code: &RuleCode) -> Option<&'static RuleMetadata> {
     RULE_CATALOG.iter().find(|item| item.code == code.as_str())
 }
 
+pub fn is_known_code(code: &str) -> bool {
+    RULE_CATALOG.iter().any(|item| item.code == code)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;

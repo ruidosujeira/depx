@@ -6,7 +6,8 @@ use crate::analysis::{
 use crate::duplicates::suggest_resolution;
 use crate::evidence::{Confidence, Evidence, EvidenceKind, EvidenceResolution, ManifestSection};
 use crate::finding::{metadata as finding_metadata, FindingSeverity, ProjectAnalysis};
-use crate::model::ProjectSnapshot;
+use crate::model::{ComponentId, ProjectSnapshot};
+use crate::plan::{ChangeRisk, PlanActionKind, PlanPriority, RemediationPlan};
 use crate::types::{
     DeprecatedPackage, DuplicateAnalysis, DuplicateSeverity, PackageExplanation, Severity,
     Vulnerability,
@@ -358,6 +359,73 @@ impl Reporter {
         println!();
     }
 
+    /// Render a prioritized dependency remediation plan.
+    pub fn report_plan(&self, plan: &RemediationPlan) {
+        println!();
+        println!("{}", "Dependency Remediation Plan".bold().underline());
+        println!();
+        if plan.actions.is_empty() {
+            println!("{}", "No remediation actions found!".green().bold());
+            println!();
+            return;
+        }
+        println!(
+            "{} action{} prioritized",
+            plan.summary.total_actions.to_string().cyan().bold(),
+            plural_s(plan.summary.total_actions)
+        );
+        println!();
+
+        for (index, action) in plan.actions.iter().enumerate() {
+            let priority = match action.priority {
+                PlanPriority::Urgent => "URGENT".red().bold(),
+                PlanPriority::High => "HIGH".red(),
+                PlanPriority::Medium => "MEDIUM".yellow(),
+                PlanPriority::Low => "LOW".dimmed(),
+            };
+            println!("{}. [{}] {}", index + 1, priority, action.title.bold());
+            println!("   Reason: {}", clean_message(&action.reason, 240).dimmed());
+            println!(
+                "   Evidence: {}; confidence {}",
+                usage_state_label(action.usage),
+                confidence_label(action.confidence)
+            );
+            if let Some(root) = &action.root_component {
+                if root != &action.component {
+                    println!("   Remediation root: {}", root.qualified_name().cyan());
+                }
+            }
+            if !action.advisory_ids.is_empty() {
+                println!("   Advisories: {}", action.advisory_ids.join(", "));
+            }
+            if action.change_risk != ChangeRisk::Manual {
+                println!("   Change risk: {}", change_risk_label(action.change_risk));
+            }
+            if let Some(command) = &action.command {
+                println!("   Suggested command: {}", command.green());
+            } else if action.kind == PlanActionKind::SecurityUpgrade
+                && action.root_component.as_ref() != Some(&action.component)
+            {
+                println!(
+                    "   Suggested action: update the remediation root and regenerate the lockfile"
+                );
+            }
+            if self.verbose {
+                for chain in &action.dependency_chains {
+                    println!(
+                        "   Chain: {}",
+                        chain
+                            .iter()
+                            .map(ComponentId::qualified_name)
+                            .collect::<Vec<_>>()
+                            .join(" -> ")
+                    );
+                }
+            }
+            println!();
+        }
+    }
+
     /// Report duplicate dependencies
     pub fn report_duplicates(&self, analysis: &DuplicateAnalysis) {
         println!();
@@ -558,6 +626,7 @@ fn evidence_description(evidence: &Evidence) -> String {
         EvidenceKind::CommonJsRequire => source_description(evidence, "CommonJS require"),
         EvidenceKind::DynamicImport => source_description(evidence, "dynamic import"),
         EvidenceKind::ReExport => source_description(evidence, "re-export"),
+        EvidenceKind::RustCrateReference => source_description(evidence, "Rust crate reference"),
         EvidenceKind::ConfigurationReference => {
             source_description(evidence, "configuration reference")
         }
@@ -624,6 +693,16 @@ fn confidence_label(confidence: Confidence) -> &'static str {
     }
 }
 
+fn change_risk_label(risk: ChangeRisk) -> &'static str {
+    match risk {
+        ChangeRisk::Patch => "patch",
+        ChangeRisk::Minor => "minor",
+        ChangeRisk::Major => "major",
+        ChangeRisk::Manual => "manual",
+        ChangeRisk::Unknown => "unknown",
+    }
+}
+
 fn report_coverage(coverage: &AnalysisCoverage) {
     println!("{}", "Analysis coverage".bold());
     println!("  Checked:");
@@ -645,9 +724,10 @@ fn coverage_area_label(area: CoverageArea) -> &'static str {
         CoverageArea::CommonJsRequires => "CommonJS require calls with string literals",
         CoverageArea::DynamicImports => "dynamic imports with string literals",
         CoverageArea::ReExports => "re-exports",
+        CoverageArea::RustCrateReferences => "Rust crate paths, imports and macro invocations",
         CoverageArea::PackageScripts => "package.json scripts",
         CoverageArea::SupportedConfigurationFiles => "supported JS/TS configuration files",
-        CoverageArea::TestFiles => "conservative JS/TS test-file patterns",
+        CoverageArea::TestFiles => "test source files",
     }
 }
 
@@ -661,7 +741,11 @@ fn limitation_label(limitation: CoverageLimitation) -> &'static str {
         CoverageLimitation::UnresolvedPackageReferences => {
             "package references that did not resolve to installed components"
         }
-        CoverageLimitation::RustSourceUsage => "Rust source usage",
+        CoverageLimitation::RustConditionalCompilation => {
+            "Rust feature and cfg-dependent reachability"
+        }
+        CoverageLimitation::RustMacroExpansion => "crate references introduced by macro expansion",
+        CoverageLimitation::GeneratedSourceCode => "generated source code outside the project tree",
     }
 }
 
