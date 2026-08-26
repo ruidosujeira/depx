@@ -116,8 +116,16 @@ CRITICAL
 
 depx queries the [OSV](https://osv.dev) database **with your exact installed versions** (npm → `npm`, Cargo → `crates.io`), so you don't drown in old CVEs that don't apply to you. The `[USED]` tag marks advisories that hit code your project actually imports.
 
+By default, `audit` exits with code `1` when it finds a high or critical vulnerability, so it can gate a CI job. Use `--fail-on` to choose a different threshold or `--fail-on never` for report-only behavior.
+
 **Options:**
 - `--used-only` — report only vulnerabilities in packages your code actually uses
+- `--fail-on <level>` — fail on `any`, `low`, `medium`, `high` (default), `critical`, or disable the gate with `never`
+
+**Exit codes:**
+- `0` — no reported vulnerability met the configured threshold
+- `1` — at least one reported vulnerability met the configured threshold
+- `2` — command-line, project, lockfile, network, or OSV error
 
 ### `depx deprecated` — find deprecated packages
 
