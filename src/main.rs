@@ -14,8 +14,9 @@ mod vulnerability;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use miette::Result;
 
 use crate::analysis::{assess_usage, used_component_ids};
@@ -24,6 +25,7 @@ use crate::finding::analyze_project;
 use crate::graph::DependencyGraph;
 use crate::model::{Ecosystem, ProjectSnapshot};
 use crate::reporter::Reporter;
+use crate::types::Severity;
 
 /// Map a detected lockfile to its OSV ecosystem identifier.
 fn osv_ecosystem(ecosystem: Ecosystem) -> &'static str {
@@ -43,6 +45,34 @@ fn osv_ecosystem(ecosystem: Ecosystem) -> &'static str {
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum AuditFailOn {
+    /// Never fail because vulnerabilities were found
+    Never,
+    /// Fail when any vulnerability is found
+    Any,
+    /// Fail on low, medium, high or critical vulnerabilities
+    Low,
+    /// Fail on medium, high or critical vulnerabilities
+    Medium,
+    /// Fail on high or critical vulnerabilities
+    High,
+    /// Fail only on critical vulnerabilities
+    Critical,
+}
+
+impl AuditFailOn {
+    fn matches(self, severity: Severity) -> bool {
+        match self {
+            Self::Never => false,
+            Self::Any | Self::Low => true,
+            Self::Medium => severity >= Severity::Medium,
+            Self::High => severity >= Severity::High,
+            Self::Critical => severity >= Severity::Critical,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -89,6 +119,10 @@ enum Commands {
         /// Only show vulnerabilities in actually used packages
         #[arg(long)]
         used_only: bool,
+
+        /// Exit with code 1 when a vulnerability meets this severity threshold
+        #[arg(long, value_enum, default_value = "high")]
+        fail_on: AuditFailOn,
     },
 
     /// List deprecated packages
@@ -115,10 +149,20 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(exit_code) => exit_code,
+        Err(error) => {
+            eprintln!("{error:?}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+async fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
 
-    match cli.command {
+    let exit_code = match cli.command {
         Commands::Analyze {
             path,
             unused,
@@ -127,15 +171,26 @@ async fn main() -> Result<()> {
             verbose,
         } => {
             run_analyze(&path, unused, !no_dev, json, verbose).await?;
+            ExitCode::SUCCESS
         }
         Commands::Why { package, path } => {
             run_why(&path, &package).await?;
+            ExitCode::SUCCESS
         }
-        Commands::Audit { path, used_only } => {
-            run_audit(&path, used_only).await?;
+        Commands::Audit {
+            path,
+            used_only,
+            fail_on,
+        } => {
+            if run_audit(&path, used_only, fail_on).await? {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Commands::Deprecated { path } => {
             run_deprecated(&path).await?;
+            ExitCode::SUCCESS
         }
         Commands::Duplicates {
             path,
@@ -143,10 +198,11 @@ async fn main() -> Result<()> {
             json,
         } => {
             run_duplicates(&path, verbose, json).await?;
+            ExitCode::SUCCESS
         }
-    }
+    };
 
-    Ok(())
+    Ok(exit_code)
 }
 
 async fn run_analyze(
@@ -226,7 +282,7 @@ async fn run_why(path: &Path, package: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_audit(path: &Path, used_only: bool) -> Result<()> {
+async fn run_audit(path: &Path, used_only: bool, fail_on: AuditFailOn) -> Result<bool> {
     let reporter = Reporter::new();
 
     reporter.status("Auditing", &format!("project at {}", path.display()));
@@ -262,7 +318,9 @@ async fn run_audit(path: &Path, used_only: bool) -> Result<()> {
 
     reporter.report_vulnerabilities(&vulnerabilities, used_only);
 
-    Ok(())
+    Ok(vulnerabilities
+        .iter()
+        .any(|vulnerability| fail_on.matches(vulnerability.severity)))
 }
 
 async fn run_deprecated(path: &Path) -> Result<()> {
@@ -351,4 +409,44 @@ fn without_dev_components(snapshot: ProjectSnapshot) -> Result<ProjectSnapshot> 
         })
         .collect();
     ProjectSnapshot::new(snapshot.root, components, dependency_edges).with_evidence(evidence)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn audit_fail_on(args: &[&str]) -> AuditFailOn {
+        let cli = Cli::try_parse_from(args).expect("audit arguments should parse");
+        match cli.command {
+            Commands::Audit { fail_on, .. } => fail_on,
+            _ => panic!("expected audit command"),
+        }
+    }
+
+    #[test]
+    fn audit_defaults_to_high_severity_threshold() {
+        assert_eq!(audit_fail_on(&["depx", "audit"]), AuditFailOn::High);
+    }
+
+    #[test]
+    fn audit_accepts_all_fail_on_values() {
+        for value in ["never", "any", "low", "medium", "high", "critical"] {
+            let args = ["depx", "audit", "--fail-on", value];
+            let _ = audit_fail_on(&args);
+        }
+    }
+
+    #[test]
+    fn audit_fail_on_thresholds_match_expected_severities() {
+        assert!(!AuditFailOn::Never.matches(Severity::Critical));
+        assert!(AuditFailOn::Any.matches(Severity::Low));
+        assert!(AuditFailOn::Low.matches(Severity::Low));
+        assert!(!AuditFailOn::Medium.matches(Severity::Low));
+        assert!(AuditFailOn::Medium.matches(Severity::Medium));
+        assert!(!AuditFailOn::High.matches(Severity::Medium));
+        assert!(AuditFailOn::High.matches(Severity::High));
+        assert!(AuditFailOn::High.matches(Severity::Critical));
+        assert!(!AuditFailOn::Critical.matches(Severity::High));
+        assert!(AuditFailOn::Critical.matches(Severity::Critical));
+    }
 }
