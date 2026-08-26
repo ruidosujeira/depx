@@ -61,9 +61,8 @@ impl ImportAnalyzer {
                 continue;
             }
 
-            // Test files are scanned too: a package imported only from tests is
-            // still genuinely used, and skipping them would wrongly flag
-            // test-only dependencies as removable.
+            // Test and supported configuration files are scanned here, then
+            // classified into distinct evidence roles by the collector.
             self.analyze_file(path, &mut import_map)?;
         }
 

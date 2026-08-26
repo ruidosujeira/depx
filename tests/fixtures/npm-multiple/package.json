@@ -1,0 +1,9 @@
+{
+  "name": "npm-multiple-fixture",
+  "version": "1.0.0",
+  "dependencies": {
+    "a": "1.0.0",
+    "b": "1.0.0",
+    "shared": "1.0.0"
+  }
+}

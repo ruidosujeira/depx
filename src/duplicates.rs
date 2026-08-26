@@ -3,7 +3,10 @@ use std::path::Path;
 use miette::{bail, Result};
 use semver::Version;
 
-use crate::lockfile::{CargoLockfileParser, LockfileParser, LockfileType};
+use crate::ecosystem;
+use crate::finding::rules::duplicate_findings;
+use crate::finding::FindingDetails;
+use crate::model::Ecosystem;
 use crate::types::{
     DuplicateAnalysis, DuplicateGroup, DuplicateSeverity, DuplicateStats, DuplicateVersion,
 };
@@ -20,45 +23,52 @@ impl<'a> DuplicateAnalyzer<'a> {
 
     /// Analyze the project for duplicate dependencies
     pub fn analyze(&self) -> Result<DuplicateAnalysis> {
-        let lockfile_parser = LockfileParser::new(self.root)?;
-
-        match lockfile_parser.lockfile_type() {
-            LockfileType::Cargo => self.analyze_cargo(lockfile_parser.lockfile_path()),
-            _ => bail!("Duplicate analysis currently only supports Cargo.lock (Rust projects)"),
+        let adapter = ecosystem::detect(self.root)?;
+        match adapter.ecosystem() {
+            Ecosystem::Cargo => self.analyze_cargo(adapter),
+            Ecosystem::Npm => {
+                bail!("Duplicate analysis currently only supports Cargo.lock (Rust projects)")
+            }
         }
     }
 
     /// Analyze Cargo.lock for duplicates
-    fn analyze_cargo(&self, lockfile_path: &Path) -> Result<DuplicateAnalysis> {
-        let parser = CargoLockfileParser::new(lockfile_path);
-        let packages_by_name = parser.parse_for_duplicates()?;
-
+    fn analyze_cargo(
+        &self,
+        adapter: &dyn crate::ecosystem::EcosystemAdapter,
+    ) -> Result<DuplicateAnalysis> {
+        let snapshot = adapter.build_snapshot(self.root)?;
+        let findings = duplicate_findings(&snapshot)?;
         let mut duplicates = Vec::new();
-
-        for (name, versions) in packages_by_name {
-            // Skip if only one version exists
-            if versions.len() <= 1 {
+        for finding in findings {
+            let FindingDetails::DuplicateVersions { components, .. } = finding.details else {
                 continue;
-            }
-
-            // Build version info
-            let mut version_infos: Vec<DuplicateVersion> = versions
-                .into_iter()
-                .map(|v| DuplicateVersion {
-                    version: v.version,
-                    dependents: v.dependents,
-                    transitive_count: 0, // TODO: calculate transitive dependents
+            };
+            let mut version_infos: Vec<_> = components
+                .iter()
+                .map(|component| {
+                    let mut dependents: Vec<_> = snapshot
+                        .dependency_edges
+                        .iter()
+                        .filter(|edge| edge.to == *component)
+                        .map(|edge| edge.from.name.clone())
+                        .collect();
+                    dependents.sort();
+                    dependents.dedup();
+                    DuplicateVersion {
+                        version: component.version.clone(),
+                        dependents,
+                        transitive_count: 0,
+                    }
                 })
                 .collect();
-
-            // Sort versions for consistent output
-            version_infos.sort_by(|a, b| compare_versions(&a.version, &b.version));
-
-            // Calculate severity
+            version_infos.sort_by(|left, right| {
+                compare_versions(&left.version, &right.version)
+                    .then_with(|| left.dependents.cmp(&right.dependents))
+            });
             let severity = calculate_severity(&version_infos);
-
             duplicates.push(DuplicateGroup {
-                name,
+                name: finding.subject.name,
                 versions: version_infos,
                 severity,
             });
@@ -232,6 +242,10 @@ mod tests {
         assert_eq!(
             compare_versions("1.0.0", "1.0.0"),
             std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_versions("2.0.0", "10.0.0"),
+            std::cmp::Ordering::Less
         );
     }
 }

@@ -1,52 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Represents a package in the dependency tree
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Package {
-    /// Package name (e.g., "lodash", "@types/node")
-    pub name: String,
-
-    /// Package version (e.g., "4.17.21")
-    pub version: String,
-
-    /// Whether this is a direct dependency (in package.json) or transitive
-    pub is_direct: bool,
-
-    /// Whether this is a dev dependency
-    pub is_dev: bool,
-
-    /// Dependencies of this package
-    pub dependencies: Vec<String>,
-
-    /// Whether the package is deprecated
-    pub deprecated: Option<String>,
-}
-
-impl Package {
-    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            version: version.into(),
-            is_direct: false,
-            is_dev: false,
-            dependencies: Vec::new(),
-            deprecated: None,
-        }
-    }
-
-    pub fn direct(mut self) -> Self {
-        self.is_direct = true;
-        self
-    }
-
-    pub fn with_dependencies(mut self, deps: Vec<String>) -> Self {
-        self.dependencies = deps;
-        self
-    }
-}
+use crate::analysis::UsageAssessment;
+use crate::evidence::Evidence;
+use crate::evidence::SourceSpan;
+use crate::finding::Finding;
+use crate::model::{Component, ComponentId};
 
 /// Represents an import statement found in source code
 #[derive(Debug, Clone)]
@@ -59,8 +20,14 @@ pub struct Import {
     #[allow(dead_code)]
     pub kind: ImportKind,
 
-    /// Resolved package name (for node_modules imports)
+    /// Normalized package root name, not yet resolved to a component identity.
     pub resolved_package: Option<String>,
+
+    /// Original module specifier, including any imported subpath.
+    pub specifier: String,
+
+    /// Byte span of the module specifier when supplied by the parser.
+    pub span: Option<SourceSpan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,9 +48,6 @@ pub struct ImportMap {
     /// All imports indexed by file path
     imports_by_file: HashMap<PathBuf, Vec<Import>>,
 
-    /// All external package imports (excluding relative imports)
-    package_imports: HashMap<String, Vec<Import>>,
-
     /// Number of files analyzed
     files_count: usize,
 }
@@ -95,14 +59,6 @@ impl ImportMap {
 
     pub fn add_import(&mut self, import: Import) {
         let file_path = import.file_path.clone();
-
-        // If it's a package import, index it
-        if let Some(ref pkg) = import.resolved_package {
-            self.package_imports
-                .entry(pkg.clone())
-                .or_default()
-                .push(import.clone());
-        }
 
         self.imports_by_file
             .entry(file_path)
@@ -122,50 +78,29 @@ impl ImportMap {
         self.files_count
     }
 
-    pub fn packages_used(&self) -> HashSet<String> {
-        self.package_imports.keys().cloned().collect()
+    pub fn imports(&self) -> impl Iterator<Item = &Import> {
+        self.imports_by_file.values().flatten()
     }
-
-    pub fn get_package_usages(&self, package: &str) -> Option<&Vec<Import>> {
-        self.package_imports.get(package)
-    }
-}
-
-/// Result of analyzing dependency usage
-#[derive(Debug)]
-pub struct UsageAnalysis {
-    /// Packages that are used in source code
-    pub used: Vec<PackageUsage>,
-
-    /// Packages installed but never imported (truly removable)
-    pub unused: Vec<Package>,
-
-    /// Direct dependencies that are unused (truly removable)
-    pub unused_direct: Vec<Package>,
-
-    /// Direct dependencies that are expected unused (dev/build tools)
-    pub expected_unused_direct: Vec<Package>,
-}
-
-#[derive(Debug)]
-pub struct PackageUsage {
-    pub package: Package,
-    pub import_count: usize,
-    pub files: Vec<PathBuf>,
 }
 
 /// Explanation of why a package is in the dependency tree
 #[derive(Debug)]
 pub struct PackageExplanation {
     /// The package being explained
-    pub package: Package,
+    pub package: Component,
 
     /// Chain(s) from root to this package
-    /// Each chain is a list of package names
-    pub dependency_chains: Vec<Vec<String>>,
+    /// Each chain retains the full resolved component identity.
+    pub dependency_chains: Vec<Vec<ComponentId>>,
 
-    /// Whether any chain starts from a dev dependency
-    pub is_dev_path: bool,
+    /// Evidence directly attached to this exact component.
+    pub evidence: Vec<Evidence>,
+
+    /// Evidence-derived usage assessment.
+    pub assessment: UsageAssessment,
+
+    /// Structured findings affecting this exact component.
+    pub findings: Vec<Finding>,
 }
 
 /// A known vulnerability
@@ -222,7 +157,7 @@ impl std::fmt::Display for Severity {
 /// A deprecated package
 #[derive(Debug)]
 pub struct DeprecatedPackage {
-    pub package: Package,
+    pub package: Component,
     pub message: String,
     pub is_used: bool,
 }

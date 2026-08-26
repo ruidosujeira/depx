@@ -1,7 +1,13 @@
+mod analysis;
 mod analyzer;
 mod duplicates;
+mod ecosystem;
+mod evidence;
+mod finding;
 mod graph;
-mod lockfile;
+mod model;
+mod output;
+mod query;
 mod reporter;
 mod types;
 mod vulnerability;
@@ -12,16 +18,18 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use miette::Result;
 
-use crate::analyzer::ImportAnalyzer;
+use crate::analysis::{assess_usage, used_component_ids};
+use crate::evidence::{collect_project_evidence, EvidenceKind, EvidenceResolution};
+use crate::finding::analyze_project;
 use crate::graph::DependencyGraph;
-use crate::lockfile::{LockfileParser, LockfileType};
+use crate::model::{Ecosystem, ProjectSnapshot};
 use crate::reporter::Reporter;
 
 /// Map a detected lockfile to its OSV ecosystem identifier.
-fn osv_ecosystem(lockfile_type: LockfileType) -> &'static str {
-    match lockfile_type {
-        LockfileType::Cargo => "crates.io",
-        _ => "npm",
+fn osv_ecosystem(ecosystem: Ecosystem) -> &'static str {
+    match ecosystem {
+        Ecosystem::Cargo => "crates.io",
+        Ecosystem::Npm => "npm",
     }
 }
 
@@ -45,13 +53,21 @@ enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
 
-        /// Show only unused dependencies
+        /// Show only components for which supported collectors found no usage evidence
         #[arg(long)]
         unused: bool,
 
         /// Exclude dev dependencies from analysis (included by default)
         #[arg(long)]
         no_dev: bool,
+
+        /// Emit deterministic machine-readable JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Show complete finding evidence in text output
+        #[arg(short, long)]
+        verbose: bool,
     },
 
     /// Explain why a package is installed
@@ -107,8 +123,10 @@ async fn main() -> Result<()> {
             path,
             unused,
             no_dev,
+            json,
+            verbose,
         } => {
-            run_analyze(&path, unused, !no_dev).await?;
+            run_analyze(&path, unused, !no_dev, json, verbose).await?;
         }
         Commands::Why { package, path } => {
             run_why(&path, &package).await?;
@@ -131,54 +149,63 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_analyze(path: &Path, show_unused_only: bool, include_dev: bool) -> Result<()> {
-    let reporter = Reporter::new();
+async fn run_analyze(
+    path: &Path,
+    show_unused_only: bool,
+    include_dev: bool,
+    json: bool,
+    verbose: bool,
+) -> Result<()> {
+    let reporter = if verbose {
+        Reporter::new().verbose()
+    } else {
+        Reporter::new()
+    };
+    if !json {
+        reporter.status("Analyzing", &format!("project at {}", path.display()));
+    }
 
-    reporter.status("Analyzing", &format!("project at {}", path.display()));
+    // 1. Build the normalized component inventory and resolved edge set.
+    let adapter = ecosystem::detect(path)?;
 
-    // 1. Parse lockfile to get all installed packages
-    let lockfile_parser = LockfileParser::new(path)?;
-
-    // Unused-dependency detection works by scanning JS/TS imports, which is
-    // meaningless for Rust crates. Bail early instead of cross-referencing JS
-    // imports against Cargo packages (that produces nonsense like flagging the
-    // crate itself as removable and suggesting `npm uninstall <crate>`).
-    if lockfile_parser.lockfile_type() == LockfileType::Cargo {
+    // This phase's source, script and configuration collectors target JS/TS.
+    if adapter.ecosystem() == Ecosystem::Cargo {
         miette::bail!(
             "`analyze` only supports JavaScript/TypeScript projects. \
              For Rust projects, use `depx duplicates` or `depx audit` instead."
         );
     }
 
-    let installed_packages = lockfile_parser.parse()?;
+    let snapshot = adapter.build_snapshot(path)?;
+    let snapshot = if include_dev {
+        snapshot
+    } else {
+        without_dev_components(snapshot)?
+    };
+    let collection = collect_project_evidence(snapshot)?;
 
+    let source_references = collection.source_references;
+    let files_analyzed = collection.files_analyzed;
+    let analysis = analyze_project(collection.snapshot, collection.coverage)?;
+    if json {
+        println!("{}", output::serialize_analysis(&analysis)?);
+        return Ok(());
+    }
     reporter.info(&format!(
         "Found {} installed packages",
-        installed_packages.len()
+        analysis.snapshot.components.len()
     ));
-
-    // 2. Analyze source code to find actual imports
-    let analyzer = ImportAnalyzer::new(path);
-    let imports = analyzer.analyze()?;
-
     reporter.info(&format!(
-        "Found {} import statements across {} files",
-        imports.total_imports(),
-        imports.files_analyzed()
+        "Collected {source_references} source references across {files_analyzed} files"
     ));
-
-    // 3. Build dependency graph
-    let graph = DependencyGraph::new(&installed_packages);
-
-    // 4. Cross-reference to find unused packages
-    let analysis = graph.analyze_usage(&imports, include_dev);
-
-    // 5. Report results
-    if show_unused_only {
-        reporter.report_unused(&analysis);
-    } else {
-        reporter.report_full(&analysis, &imports);
-    }
+    reporter.report_findings(&analysis, show_unused_only);
+    reporter.report_analysis(
+        &analysis.snapshot,
+        &analysis.assessments,
+        &analysis.coverage,
+        show_unused_only,
+        include_dev,
+    );
 
     Ok(())
 }
@@ -186,14 +213,14 @@ async fn run_analyze(path: &Path, show_unused_only: bool, include_dev: bool) -> 
 async fn run_why(path: &Path, package: &str) -> Result<()> {
     let reporter = Reporter::new();
 
-    let lockfile_parser = LockfileParser::new(path)?;
-    let installed_packages = lockfile_parser.parse()?;
-
-    let graph = DependencyGraph::new(&installed_packages);
+    let snapshot = ecosystem::detect(path)?.build_snapshot(path)?;
+    let collection = collect_project_evidence(snapshot)?;
+    let analysis = analyze_project(collection.snapshot, collection.coverage)?;
+    let graph = DependencyGraph::from_analysis(&analysis)?;
 
     match graph.explain_package(package) {
-        Some(explanation) => reporter.report_why(package, &explanation),
-        None => reporter.error(&format!("Package '{}' not found in dependencies", package)),
+        Ok(explanation) => reporter.report_why(package, &explanation, &analysis.coverage),
+        Err(error) => return Err(miette::miette!(error)),
     }
 
     Ok(())
@@ -204,22 +231,27 @@ async fn run_audit(path: &Path, used_only: bool) -> Result<()> {
 
     reporter.status("Auditing", &format!("project at {}", path.display()));
 
-    let lockfile_parser = LockfileParser::new(path)?;
-    let ecosystem = osv_ecosystem(lockfile_parser.lockfile_type());
-    let installed_packages = lockfile_parser.parse()?;
+    let adapter = ecosystem::detect(path)?;
+    if used_only && adapter.ecosystem() == Ecosystem::Cargo {
+        miette::bail!(
+            "`audit --used-only` is unavailable for Rust projects because Rust source usage is not yet collected"
+        );
+    }
+    let osv_ecosystem = osv_ecosystem(adapter.ecosystem());
+    let snapshot = adapter.build_snapshot(path)?;
 
-    let used_packages = if used_only {
-        let analyzer = ImportAnalyzer::new(path);
-        let imports = analyzer.analyze()?;
-        Some(imports.packages_used())
+    let used_components = if used_only {
+        let collection = collect_project_evidence(snapshot.clone())?;
+        let assessments = assess_usage(&collection.snapshot)?;
+        Some(used_component_ids(&collection.snapshot, &assessments)?)
     } else {
         None
     };
 
     let mut vulnerabilities = vulnerability::check_vulnerabilities(
-        &installed_packages,
-        used_packages.as_ref(),
-        ecosystem,
+        &snapshot.components,
+        used_components.as_ref(),
+        osv_ecosystem,
     )
     .await?;
 
@@ -238,22 +270,14 @@ async fn run_deprecated(path: &Path) -> Result<()> {
 
     reporter.status("Checking", "for deprecated packages");
 
-    let lockfile_parser = LockfileParser::new(path)?;
-    let installed_packages = lockfile_parser.parse()?;
+    let snapshot = ecosystem::detect(path)?.build_snapshot(path)?;
+    let collection = collect_project_evidence(snapshot)?;
 
-    // Determine which packages are actually reachable from the source code so
-    // we can flag deprecated packages that are still in use.
-    let analyzer = ImportAnalyzer::new(path);
-    let imports = analyzer.analyze()?;
-    let graph = DependencyGraph::new(&installed_packages);
-    let analysis = graph.analyze_usage(&imports, true);
-    let used_set: HashSet<String> = analysis
-        .used
-        .iter()
-        .map(|u| u.package.name.clone())
-        .collect();
+    let assessments = assess_usage(&collection.snapshot)?;
+    let used_set = used_component_ids(&collection.snapshot, &assessments)?;
 
-    let deprecated = vulnerability::check_deprecated(&installed_packages, Some(&used_set)).await?;
+    let deprecated =
+        vulnerability::check_deprecated(&collection.snapshot.components, Some(&used_set)).await?;
 
     reporter.report_deprecated(&deprecated);
 
@@ -267,7 +291,9 @@ async fn run_duplicates(path: &Path, verbose: bool, json: bool) -> Result<()> {
         Reporter::new()
     };
 
-    reporter.status("Analyzing", &format!("duplicates at {}", path.display()));
+    if !json {
+        reporter.status("Analyzing", &format!("duplicates at {}", path.display()));
+    }
 
     let analyzer = duplicates::DuplicateAnalyzer::new(path);
     let analysis = analyzer.analyze()?;
@@ -281,4 +307,39 @@ async fn run_duplicates(path: &Path, verbose: bool, json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn without_dev_components(snapshot: ProjectSnapshot) -> Result<ProjectSnapshot> {
+    let retained: HashSet<_> = snapshot
+        .components
+        .iter()
+        .filter(|component| !component.dev)
+        .map(|component| component.id.clone())
+        .collect();
+    let components = snapshot
+        .components
+        .into_iter()
+        .filter(|component| retained.contains(&component.id))
+        .collect();
+    let dependency_edges = snapshot
+        .dependency_edges
+        .into_iter()
+        .filter(|edge| retained.contains(&edge.from) && retained.contains(&edge.to))
+        .collect();
+    let evidence = snapshot
+        .evidence
+        .into_iter()
+        .filter(|item| retained.contains(&item.subject))
+        .filter(|item| match &item.kind {
+            EvidenceKind::TransitiveDependency { from, .. } => retained.contains(from),
+            _ => true,
+        })
+        .filter(|item| match &item.resolution {
+            EvidenceResolution::Exact => true,
+            EvidenceResolution::Ambiguous { candidates } => candidates
+                .iter()
+                .all(|candidate| retained.contains(candidate)),
+        })
+        .collect();
+    ProjectSnapshot::new(snapshot.root, components, dependency_edges).with_evidence(evidence)
 }

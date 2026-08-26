@@ -1,9 +1,15 @@
 use colored::Colorize;
 
+use crate::analysis::{
+    AnalysisCoverage, CoverageArea, CoverageLimitation, UsageAssessment, UsageState,
+};
 use crate::duplicates::suggest_resolution;
+use crate::evidence::{Confidence, Evidence, EvidenceKind, EvidenceResolution, ManifestSection};
+use crate::finding::{metadata as finding_metadata, FindingSeverity, ProjectAnalysis};
+use crate::model::ProjectSnapshot;
 use crate::types::{
-    DeprecatedPackage, DuplicateAnalysis, DuplicateSeverity, ImportMap, PackageExplanation,
-    Severity, UsageAnalysis, Vulnerability,
+    DeprecatedPackage, DuplicateAnalysis, DuplicateSeverity, PackageExplanation, Severity,
+    Vulnerability,
 };
 
 /// Reporter for formatted terminal output
@@ -31,213 +37,198 @@ impl Reporter {
         println!("{:>12} {}", "Info".cyan().bold(), message);
     }
 
-    /// Print an error message
-    pub fn error(&self, message: &str) {
-        println!("{:>12} {}", "Error".red().bold(), message);
-    }
-
-    /// Report full analysis results
-    pub fn report_full(&self, analysis: &UsageAnalysis, _imports: &ImportMap) {
+    /// Render validated structured findings without deriving rule semantics.
+    pub fn report_findings(&self, analysis: &ProjectAnalysis, no_evidence_only: bool) {
         println!();
-        println!("{}", "Dependency Analysis Report".bold().underline());
+        println!("{}", "Findings".bold().underline());
         println!();
-
-        // Summary
-        println!("{}", "Summary".bold());
-        println!(
-            "  {} packages used",
-            analysis.used.len().to_string().green()
-        );
-        if !analysis.unused_direct.is_empty() {
-            println!(
-                "  {} packages unused {}",
-                analysis.unused_direct.len().to_string().red(),
-                "(removable)".red()
-            );
-        }
-        if !analysis.expected_unused_direct.is_empty() {
-            println!(
-                "  {} dev/build tools {}",
-                analysis.expected_unused_direct.len().to_string().cyan(),
-                "(expected, not imported)".dimmed()
-            );
-        }
-        println!();
-
-        // Unused direct dependencies (truly removable)
-        if !analysis.unused_direct.is_empty() {
-            println!("{}", "Unused Dependencies (safe to remove):".red().bold());
-            for pkg in &analysis.unused_direct {
-                let dev_marker = if pkg.is_dev { " (dev)" } else { "" };
-                println!(
-                    "  {} {}{}",
-                    "-".red(),
-                    format!("{}@{}", pkg.name, pkg.version).white(),
-                    dev_marker.dimmed()
-                );
-            }
+        let findings: Vec<_> = analysis
+            .findings
+            .iter()
+            .filter(|finding| {
+                !no_evidence_only
+                    || analysis.assessments.iter().any(|assessment| {
+                        assessment.component == finding.subject
+                            && assessment.state == UsageState::NoEvidence
+                    })
+            })
+            .collect();
+        if findings.is_empty() {
+            println!("  {}", "No findings produced by the enabled rules.".green());
             println!();
-            println!("  {} {}", "Tip:".dimmed(), "npm uninstall <package>".cyan());
-            println!();
-        }
-
-        // Expected unused (dev/build tools) - show only if there are truly unused ones or verbose
-        if !analysis.expected_unused_direct.is_empty() {
-            println!(
-                "{}",
-                "Dev/Build Tools (not imported, expected):".cyan().bold()
-            );
-            for pkg in &analysis.expected_unused_direct {
-                println!(
-                    "  {} {}",
-                    "~".cyan(),
-                    format!("{}@{}", pkg.name, pkg.version).dimmed()
-                );
-            }
-            println!();
-        }
-
-        // Used packages (verbose only)
-        if self.verbose && !analysis.used.is_empty() {
-            println!("{}", "Used Packages:".green().bold());
-            for usage in &analysis.used {
-                let pkg = &usage.package;
-                let direct_marker = if pkg.is_direct { " (direct)" } else { "" };
-                let usage_info = if usage.import_count > 0 {
-                    format!(
-                        " — {} import{} in {} file{}",
-                        usage.import_count,
-                        if usage.import_count == 1 { "" } else { "s" },
-                        usage.files.len(),
-                        if usage.files.len() == 1 { "" } else { "s" }
-                    )
-                } else {
-                    String::new()
-                };
-                println!(
-                    "  {} {}{}{}",
-                    "+".green(),
-                    format!("{}@{}", pkg.name, pkg.version).white(),
-                    direct_marker.dimmed(),
-                    usage_info.dimmed()
-                );
-            }
-            println!();
-        }
-
-        // Unused transitive dependencies (verbose only)
-        if self.verbose {
-            let unused_transitive: Vec<_> =
-                analysis.unused.iter().filter(|p| !p.is_direct).collect();
-
-            if !unused_transitive.is_empty() {
-                println!("{}", "Unused Transitive Dependencies:".yellow().bold());
-                for pkg in unused_transitive.iter().take(20) {
-                    println!(
-                        "  {} {}",
-                        "?".yellow(),
-                        format!("{}@{}", pkg.name, pkg.version).dimmed()
-                    );
-                }
-                if unused_transitive.len() > 20 {
-                    println!(
-                        "  {} ... and {} more",
-                        "".dimmed(),
-                        unused_transitive.len() - 20
-                    );
-                }
-                println!();
-            }
-        }
-    }
-
-    /// Report only unused packages
-    pub fn report_unused(&self, analysis: &UsageAnalysis) {
-        println!();
-
-        if analysis.unused_direct.is_empty() && analysis.unused.is_empty() {
-            println!("{}", "All dependencies appear to be in use!".green().bold());
             return;
         }
-
-        println!(
-            "{}",
-            "Potentially Unused Dependencies"
-                .yellow()
-                .bold()
-                .underline()
-        );
-        println!();
-
-        if !analysis.unused_direct.is_empty() {
-            println!("{}", "Direct dependencies (in package.json):".bold());
-            for pkg in &analysis.unused_direct {
-                let dev_marker = if pkg.is_dev { " (dev)" } else { "" };
-                println!(
-                    "  {} {}{}",
-                    "-".red(),
-                    pkg.name.white(),
-                    dev_marker.dimmed()
-                );
+        for finding in findings {
+            let metadata = finding_metadata(&finding.rule);
+            let severity = match finding.severity {
+                FindingSeverity::Info => "Info".cyan(),
+                FindingSeverity::Warning => "Warning".yellow(),
+                FindingSeverity::Error => "Error".red().bold(),
+            };
+            println!(
+                "{} {}  {}",
+                severity,
+                finding.rule.as_str().bold(),
+                finding.subject.qualified_name().cyan()
+            );
+            println!(
+                "  {}",
+                metadata.map_or(finding.summary.as_str(), |item| item.name)
+            );
+            if self.verbose {
+                if let Some(metadata) = metadata {
+                    println!("  {}", metadata.description.dimmed());
+                }
+                println!("  {}", finding.explanation.dimmed());
+                for evidence in analysis
+                    .snapshot
+                    .evidence
+                    .iter()
+                    .filter(|evidence| finding.evidence.binary_search(&evidence.id).is_ok())
+                {
+                    println!("    evidence: {}", evidence_description(evidence).dimmed());
+                }
+            }
+            if let Some(recommendation) = &finding.recommendation {
+                println!("  Recommendation: {}", recommendation.message.dimmed());
             }
             println!();
-            println!(
-                "{}",
-                "Tip: Run `npm uninstall <package>` to remove unused packages".dimmed()
-            );
         }
+    }
 
+    /// Render evidence-backed assessments without deriving semantics here.
+    pub fn report_analysis(
+        &self,
+        snapshot: &ProjectSnapshot,
+        assessments: &[UsageAssessment],
+        coverage: &AnalysisCoverage,
+        no_evidence_only: bool,
+        include_dev: bool,
+    ) {
         println!();
+        println!("{}", "Dependency Evidence Report".bold().underline());
+        println!();
+        let groups = [
+            (UsageState::ConfirmedRuntime, "Confirmed runtime usage"),
+            (
+                UsageState::ConfirmedDevelopment,
+                "Confirmed development usage",
+            ),
+            (UsageState::ConfirmedBuild, "Confirmed build usage"),
+            (UsageState::ConfirmedTest, "Confirmed test usage"),
+            (UsageState::ConfigurationOnly, "Configuration references"),
+            (UsageState::TransitivelyRequired, "Transitive presence"),
+            (UsageState::Ambiguous, "Ambiguous evidence"),
+            (UsageState::NoEvidence, "No evidence found"),
+        ];
+        for (state, title) in groups {
+            if no_evidence_only && state != UsageState::NoEvidence {
+                continue;
+            }
+            let items: Vec<_> = assessments
+                .iter()
+                .filter(|assessment| assessment.state == state)
+                .filter(|assessment| {
+                    include_dev
+                        || snapshot
+                            .components
+                            .iter()
+                            .find(|component| component.id == assessment.component)
+                            .is_none_or(|component| !component.dev)
+                })
+                .collect();
+            if items.is_empty() {
+                continue;
+            }
+            println!("{}", title.bold());
+            for assessment in items {
+                println!("  {}", assessment.component.qualified_name().cyan());
+                for evidence in evidence_for(snapshot, assessment)
+                    .into_iter()
+                    .filter(|evidence| evidence_relevant_to_state(evidence, state))
+                {
+                    println!("    {}", evidence_description(evidence).dimmed());
+                }
+                if state == UsageState::NoEvidence {
+                    println!("    no supported source, script or configuration references found");
+                    println!(
+                        "    review unsupported runtime loading and configuration before removal"
+                    );
+                }
+            }
+            println!();
+        }
+        report_coverage(coverage);
     }
 
     /// Report why a package is installed
-    pub fn report_why(&self, _package_name: &str, explanation: &PackageExplanation) {
+    pub fn report_why(
+        &self,
+        _package_name: &str,
+        explanation: &PackageExplanation,
+        coverage: &AnalysisCoverage,
+    ) {
         println!();
-        println!(
-            "{} {}@{}",
-            "Package:".bold(),
-            explanation.package.name.cyan(),
-            explanation.package.version
-        );
+        println!("{}", explanation.package.id.qualified_name().cyan().bold());
         println!();
-
-        if explanation.package.is_direct {
-            println!(
-                "  {} This is a {} declared in the manifest",
-                "->".green(),
-                if explanation.package.is_dev {
-                    "dev dependency".yellow()
-                } else {
-                    "direct dependency".green()
-                }
-            );
-        } else {
-            println!("{}", "Dependency chains:".bold());
-
-            for (i, chain) in explanation.dependency_chains.iter().enumerate() {
-                let chain_str = chain.join(" -> ");
-
-                let prefix = if i == 0 { "->" } else { "  " };
-                println!("  {} {}", prefix.green(), chain_str);
-            }
-
-            if explanation.dependency_chains.is_empty() {
+        println!("{}", "Presence".bold());
+        for evidence in explanation.evidence.iter().filter(|evidence| {
+            matches!(
+                evidence.kind,
+                EvidenceKind::ManifestDeclaration { .. }
+                    | EvidenceKind::TransitiveDependency { .. }
+            )
+        }) {
+            println!("  {}", evidence_description(evidence));
+        }
+        for chain in &explanation.dependency_chains {
+            if chain.len() > 1 {
                 println!(
-                    "  {} Could not determine dependency chain (might be orphaned)",
-                    "?".yellow()
+                    "  dependency chain: {}",
+                    chain
+                        .iter()
+                        .map(|id| id.qualified_name())
+                        .collect::<Vec<_>>()
+                        .join(" -> ")
                 );
             }
         }
-
-        if explanation.is_dev_path {
-            println!();
-            println!(
-                "  {} This package is only required for development",
-                "Note:".dimmed()
-            );
-        }
-
         println!();
+        println!("{}", "Evidence".bold());
+        let usage_evidence: Vec<_> = explanation
+            .evidence
+            .iter()
+            .filter(|evidence| {
+                !matches!(
+                    evidence.kind,
+                    EvidenceKind::ManifestDeclaration { .. }
+                        | EvidenceKind::TransitiveDependency { .. }
+                )
+            })
+            .collect();
+        if usage_evidence.is_empty() {
+            println!("  no supported usage evidence found");
+        } else {
+            for evidence in usage_evidence {
+                println!("  {}", evidence_description(evidence));
+            }
+        }
+        println!();
+        println!("{}", "Assessment".bold());
+        println!("  {}", usage_state_label(explanation.assessment.state));
+        println!(
+            "  confidence: {}",
+            confidence_label(explanation.assessment.confidence)
+        );
+        println!();
+        if !explanation.findings.is_empty() {
+            println!("{}", "Findings".bold());
+            for finding in &explanation.findings {
+                println!("  {}  {}", finding.rule.as_str(), finding.summary);
+            }
+            println!();
+        }
+        report_coverage(coverage);
     }
 
     /// Report vulnerabilities
@@ -355,8 +346,8 @@ impl Reporter {
             println!(
                 "  {} {}@{}{}",
                 "-".yellow(),
-                dep.package.name.white(),
-                dep.package.version,
+                dep.package.id.name.white(),
+                dep.package.id.version,
                 used_marker
             );
             println!("    {}", dep.message.dimmed());
@@ -517,5 +508,166 @@ impl Reporter {
 impl Default for Reporter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn evidence_for<'a>(
+    snapshot: &'a ProjectSnapshot,
+    assessment: &UsageAssessment,
+) -> Vec<&'a Evidence> {
+    snapshot
+        .evidence
+        .iter()
+        .filter(|evidence| assessment.evidence.binary_search(&evidence.id).is_ok())
+        .collect()
+}
+
+fn evidence_relevant_to_state(evidence: &Evidence, state: UsageState) -> bool {
+    match state {
+        UsageState::NoEvidence => {
+            matches!(evidence.kind, EvidenceKind::ManifestDeclaration { .. })
+        }
+        UsageState::TransitivelyRequired => {
+            matches!(evidence.kind, EvidenceKind::TransitiveDependency { .. })
+        }
+        _ => !matches!(
+            evidence.kind,
+            EvidenceKind::ManifestDeclaration { .. } | EvidenceKind::TransitiveDependency { .. }
+        ),
+    }
+}
+
+fn evidence_description(evidence: &Evidence) -> String {
+    let base = match &evidence.kind {
+        EvidenceKind::ManifestDeclaration { section } => {
+            format!(
+                "declared in {} {}",
+                evidence.origin.path.display(),
+                manifest_section_label(*section)
+            )
+        }
+        EvidenceKind::TransitiveDependency { from, .. } => {
+            format!("required by {}", from.qualified_name())
+        }
+        EvidenceKind::StaticImport => source_description(evidence, "static import"),
+        EvidenceKind::CommonJsRequire => source_description(evidence, "CommonJS require"),
+        EvidenceKind::DynamicImport => source_description(evidence, "dynamic import"),
+        EvidenceKind::ReExport => source_description(evidence, "re-export"),
+        EvidenceKind::ConfigurationReference => {
+            source_description(evidence, "configuration reference")
+        }
+        EvidenceKind::PackageScript { .. } => evidence
+            .origin
+            .description
+            .clone()
+            .unwrap_or_else(|| "referenced by package script".to_string()),
+    };
+    match &evidence.resolution {
+        EvidenceResolution::Exact => base,
+        EvidenceResolution::Ambiguous { candidates } => format!(
+            "{base} (ambiguous: {})",
+            candidates
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn manifest_section_label(section: ManifestSection) -> &'static str {
+    match section {
+        ManifestSection::Dependencies => "dependencies",
+        ManifestSection::DevDependencies => "devDependencies",
+        ManifestSection::OptionalDependencies => "optionalDependencies",
+        ManifestSection::PeerDependencies => "peerDependencies",
+        ManifestSection::BuildDependencies => "build-dependencies",
+        ManifestSection::WorkspaceDependencies => "workspace.dependencies",
+    }
+}
+
+fn source_description(evidence: &Evidence, mechanism: &str) -> String {
+    format!(
+        "{} {} ({mechanism})",
+        evidence.origin.path.display(),
+        evidence
+            .origin
+            .description
+            .as_deref()
+            .unwrap_or("references package")
+    )
+}
+
+pub(crate) fn usage_state_label(state: UsageState) -> &'static str {
+    match state {
+        UsageState::ConfirmedRuntime => "confirmed runtime usage",
+        UsageState::ConfirmedDevelopment => "confirmed development usage",
+        UsageState::ConfirmedBuild => "confirmed build usage",
+        UsageState::ConfirmedTest => "confirmed test usage",
+        UsageState::ConfigurationOnly => "configuration-only reference",
+        UsageState::TransitivelyRequired => "transitively required for presence",
+        UsageState::Ambiguous => "ambiguous component resolution",
+        UsageState::NoEvidence => "no usage evidence found",
+    }
+}
+
+fn confidence_label(confidence: Confidence) -> &'static str {
+    match confidence {
+        Confidence::High => "high",
+        Confidence::Medium => "medium",
+        Confidence::Low => "low",
+    }
+}
+
+fn report_coverage(coverage: &AnalysisCoverage) {
+    println!("{}", "Analysis coverage".bold());
+    println!("  Checked:");
+    for area in &coverage.checked {
+        println!("    - {}", coverage_area_label(*area));
+    }
+    println!("  Not checked:");
+    for limitation in &coverage.not_checked {
+        println!("    - {}", limitation_label(*limitation));
+    }
+    println!();
+}
+
+fn coverage_area_label(area: CoverageArea) -> &'static str {
+    match area {
+        CoverageArea::ManifestDeclarations => "manifest declarations",
+        CoverageArea::DependencyGraph => "resolved dependency graph",
+        CoverageArea::StaticImports => "static imports",
+        CoverageArea::CommonJsRequires => "CommonJS require calls with string literals",
+        CoverageArea::DynamicImports => "dynamic imports with string literals",
+        CoverageArea::ReExports => "re-exports",
+        CoverageArea::PackageScripts => "package.json scripts",
+        CoverageArea::SupportedConfigurationFiles => "supported JS/TS configuration files",
+        CoverageArea::TestFiles => "conservative JS/TS test-file patterns",
+    }
+}
+
+fn limitation_label(limitation: CoverageLimitation) -> &'static str {
+    match limitation {
+        CoverageLimitation::ComputedModuleNames => "computed runtime module names",
+        CoverageLimitation::FrameworkPluginDiscovery => "framework plugin auto-discovery",
+        CoverageLimitation::ArbitraryShellEvaluation => "arbitrary shell evaluation",
+        CoverageLimitation::UnsupportedConfigurationFormats => "unsupported configuration formats",
+        CoverageLimitation::PackageBinaryAliases => "unknown package-to-binary aliases",
+        CoverageLimitation::UnresolvedPackageReferences => {
+            "package references that did not resolve to installed components"
+        }
+        CoverageLimitation::RustSourceUsage => "Rust source usage",
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+
+    #[test]
+    fn no_evidence_never_claims_safe_removal() {
+        let label = usage_state_label(UsageState::NoEvidence);
+        assert!(!label.contains("safe"));
+        assert!(!label.contains("remove"));
     }
 }
