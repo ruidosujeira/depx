@@ -83,9 +83,10 @@ Dev/Build Tools (not imported, expected):
 depx parses your source with [oxc](https://oxc.rs) and matches imports against the lockfile. It separates **truly unused** packages from **dev/build tools that aren't meant to be imported** (`@types/*`, `typescript`, `eslint`, `vitest`, bundlers, etc.), so it won't tell you to uninstall your toolchain.
 
 **Options:**
-- `--unused` — show only the unused packages
-- `--include-dev` — include dev dependencies in the analysis (default: `true`)
-- `-v` / `--verbose` *(via the full report)* — list each used package with its import count and files
+- `--unused` — show only components without supported usage evidence
+- `--no-dev` — exclude development dependencies (included by default)
+- `--json` — emit deterministic machine-readable JSON
+- `-v` / `--verbose` — show complete finding explanations and evidence
 
 ### `depx why <package>` — explain why a package is installed
 
