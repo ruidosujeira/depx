@@ -1,0 +1,25 @@
+{
+  "name": "npm-evidence-fixture",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "npx vite && pnpm exec biome check .",
+    "test": "bunx vitest run",
+    "build": "NODE_ENV=production tsc && vite build",
+    "lint": "npm exec -- biome check .",
+    "scope": "@scope/pkg --check"
+  },
+  "dependencies": {
+    "lodash": "4.17.21",
+    "@scope/pkg": "1.2.3",
+    "cjs-pkg": "1.0.0",
+    "dynamic-pkg": "1.0.0",
+    "export-pkg": "1.0.0",
+    "no-evidence": "1.0.0"
+  },
+  "devDependencies": {
+    "vite": "7.0.0",
+    "vitest": "3.0.0",
+    "typescript": "5.0.0",
+    "@biomejs/biome": "2.0.0"
+  }
+}

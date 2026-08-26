@@ -1,0 +1,30 @@
+version = 3
+
+[[package]]
+name = "cargo-normalized-fixture"
+version = "0.1.0"
+dependencies = [
+ "foo 2.0.0",
+ "test-helper",
+]
+
+[[package]]
+name = "foo"
+version = "1.0.0"
+source = "registry+https://example.invalid/index"
+
+[[package]]
+name = "foo"
+version = "2.0.0"
+source = "registry+https://example.invalid/index"
+dependencies = ["transitive"]
+
+[[package]]
+name = "test-helper"
+version = "1.0.0"
+source = "registry+https://example.invalid/index"
+
+[[package]]
+name = "transitive"
+version = "3.0.0"
+source = "registry+https://example.invalid/index"

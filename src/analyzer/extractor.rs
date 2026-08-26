@@ -2,10 +2,15 @@ use std::path::Path;
 
 use miette::Result;
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{Argument, Expression, Statement};
+use oxc_ast::ast::{
+    Argument, CallExpression, ExportAllDeclaration, ExportNamedDeclaration, Expression,
+    ImportDeclaration, ImportExpression, TSExternalModuleReference,
+};
+use oxc_ast::visit::{walk, Visit};
 use oxc_parser::Parser;
-use oxc_span::SourceType;
+use oxc_span::{SourceType, Span};
 
+use crate::evidence::SourceSpan;
 use crate::types::{Import, ImportKind};
 
 use super::extract_package_name;
@@ -29,148 +34,101 @@ impl<'a> ImportExtractor<'a> {
         let parser = Parser::new(&allocator, self.source, source_type);
         let parsed = parser.parse();
 
-        // We continue even if there are parse errors - partial results are better than none
-        if !parsed.errors.is_empty() {
-            // Could log warnings here if needed
+        if let Some(error) = parsed.errors.first() {
+            return Err(miette::miette!(
+                "Failed to parse {}: {}",
+                self.path.display(),
+                error
+            ));
         }
 
         let mut imports = Vec::new();
-
-        for stmt in &parsed.program.body {
-            self.extract_from_statement(stmt, &mut imports);
+        ImportVisitor {
+            path: self.path,
+            imports: &mut imports,
         }
+        .visit_program(&parsed.program);
 
         Ok(imports)
     }
+}
 
-    fn extract_from_statement(&self, stmt: &Statement, imports: &mut Vec<Import>) {
-        match stmt {
-            // ES6 imports: import x from 'package'
-            Statement::ImportDeclaration(decl) => {
-                let specifier = decl.source.value.as_str();
+struct ImportVisitor<'a> {
+    path: &'a Path,
+    imports: &'a mut Vec<Import>,
+}
 
-                if let Some(package_name) = extract_package_name(specifier) {
-                    imports.push(Import {
-                        file_path: self.path.to_path_buf(),
-                        kind: ImportKind::EsModule,
-                        resolved_package: Some(package_name),
-                    });
-                }
-            }
-
-            // Re-exports: export { x } from 'package'
-            Statement::ExportNamedDeclaration(decl) => {
-                if let Some(source) = &decl.source {
-                    let specifier = source.value.as_str();
-
-                    if let Some(package_name) = extract_package_name(specifier) {
-                        imports.push(Import {
-                            file_path: self.path.to_path_buf(),
-                            kind: ImportKind::ReExport,
-                            resolved_package: Some(package_name),
-                        });
-                    }
-                }
-            }
-
-            // export * from 'package'
-            Statement::ExportAllDeclaration(decl) => {
-                let specifier = decl.source.value.as_str();
-
-                if let Some(package_name) = extract_package_name(specifier) {
-                    imports.push(Import {
-                        file_path: self.path.to_path_buf(),
-                        kind: ImportKind::ReExport,
-                        resolved_package: Some(package_name),
-                    });
-                }
-            }
-
-            // Look for require() calls and dynamic imports in expression statements
-            Statement::ExpressionStatement(expr_stmt) => {
-                self.extract_from_expression(&expr_stmt.expression, imports);
-            }
-
-            // Variable declarations might contain require() or import()
-            Statement::VariableDeclaration(var_decl) => {
-                for declarator in &var_decl.declarations {
-                    if let Some(init) = &declarator.init {
-                        self.extract_from_expression(init, imports);
-                    }
-                }
-            }
-
-            _ => {}
+impl ImportVisitor<'_> {
+    fn record(&mut self, specifier: &str, kind: ImportKind, span: Span) {
+        if let Some(package_name) = extract_package_name(specifier) {
+            self.imports.push(Import {
+                file_path: self.path.to_path_buf(),
+                kind,
+                resolved_package: Some(package_name),
+                specifier: specifier.to_string(),
+                span: Some(source_span(span.start, span.end)),
+            });
         }
     }
+}
 
-    fn extract_from_expression(&self, expr: &Expression, imports: &mut Vec<Import>) {
-        match expr {
-            // require('package')
-            Expression::CallExpression(call) => {
-                // Check for require()
-                if let Expression::Identifier(ident) = &call.callee {
-                    if ident.name == "require" {
-                        if let Some(Argument::StringLiteral(lit)) = call.arguments.first() {
-                            let specifier = lit.value.as_str();
+impl<'ast> Visit<'ast> for ImportVisitor<'_> {
+    fn visit_import_declaration(&mut self, declaration: &ImportDeclaration<'ast>) {
+        self.record(
+            declaration.source.value.as_str(),
+            ImportKind::EsModule,
+            declaration.source.span,
+        );
+        walk::walk_import_declaration(self, declaration);
+    }
 
-                            if let Some(package_name) = extract_package_name(specifier) {
-                                imports.push(Import {
-                                    file_path: self.path.to_path_buf(),
-                                    kind: ImportKind::CommonJs,
-                                    resolved_package: Some(package_name),
-                                });
-                            }
-                        }
-                    }
-                }
-
-                // Recursively check arguments for nested requires/imports
-                for arg in &call.arguments {
-                    if let Argument::SpreadElement(spread) = arg {
-                        self.extract_from_expression(&spread.argument, imports);
-                    } else if let Some(expr) = arg.as_expression() {
-                        self.extract_from_expression(expr, imports);
-                    }
-                }
-            }
-
-            // Dynamic import: import('package')
-            Expression::ImportExpression(import_expr) => {
-                if let Expression::StringLiteral(lit) = &import_expr.source {
-                    let specifier = lit.value.as_str();
-
-                    if let Some(package_name) = extract_package_name(specifier) {
-                        imports.push(Import {
-                            file_path: self.path.to_path_buf(),
-                            kind: ImportKind::Dynamic,
-                            resolved_package: Some(package_name),
-                        });
-                    }
-                }
-            }
-
-            // Recurse into other expressions
-            Expression::AwaitExpression(await_expr) => {
-                self.extract_from_expression(&await_expr.argument, imports);
-            }
-
-            Expression::ConditionalExpression(cond) => {
-                self.extract_from_expression(&cond.consequent, imports);
-                self.extract_from_expression(&cond.alternate, imports);
-            }
-
-            Expression::LogicalExpression(logical) => {
-                self.extract_from_expression(&logical.left, imports);
-                self.extract_from_expression(&logical.right, imports);
-            }
-
-            Expression::AssignmentExpression(assign) => {
-                self.extract_from_expression(&assign.right, imports);
-            }
-
-            _ => {}
+    fn visit_export_named_declaration(&mut self, declaration: &ExportNamedDeclaration<'ast>) {
+        if let Some(source) = &declaration.source {
+            self.record(source.value.as_str(), ImportKind::ReExport, source.span);
         }
+        walk::walk_export_named_declaration(self, declaration);
+    }
+
+    fn visit_export_all_declaration(&mut self, declaration: &ExportAllDeclaration<'ast>) {
+        self.record(
+            declaration.source.value.as_str(),
+            ImportKind::ReExport,
+            declaration.source.span,
+        );
+        walk::walk_export_all_declaration(self, declaration);
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'ast>) {
+        if matches!(&call.callee, Expression::Identifier(identifier) if identifier.name == "require")
+        {
+            if let Some(Argument::StringLiteral(literal)) = call.arguments.first() {
+                self.record(literal.value.as_str(), ImportKind::CommonJs, literal.span);
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_import_expression(&mut self, import: &ImportExpression<'ast>) {
+        if let Expression::StringLiteral(literal) = &import.source {
+            self.record(literal.value.as_str(), ImportKind::Dynamic, literal.span);
+        }
+        walk::walk_import_expression(self, import);
+    }
+
+    fn visit_ts_external_module_reference(&mut self, reference: &TSExternalModuleReference<'ast>) {
+        self.record(
+            reference.expression.value.as_str(),
+            ImportKind::CommonJs,
+            reference.expression.span,
+        );
+        walk::walk_ts_external_module_reference(self, reference);
+    }
+}
+
+fn source_span(start: u32, end: u32) -> SourceSpan {
+    SourceSpan {
+        offset: start,
+        length: end.saturating_sub(start),
     }
 }
 
@@ -246,5 +204,38 @@ const mod = await import('lodash');
         let imports = extract_imports(source);
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].kind, ImportKind::Dynamic);
+    }
+
+    #[test]
+    fn finds_imports_nested_in_functions_classes_and_callbacks() {
+        let source = r#"
+function load() {
+    return require('inside-function');
+}
+
+const lazy = async () => import('inside-arrow');
+
+class Loader {
+    method() {
+        [1].map(() => require('inside-callback'));
+    }
+}
+"#;
+        let imports = extract_imports(source);
+        let packages: Vec<_> = imports
+            .iter()
+            .filter_map(|import| import.resolved_package.as_deref())
+            .collect();
+        assert_eq!(
+            packages,
+            vec!["inside-function", "inside-arrow", "inside-callback"]
+        );
+    }
+
+    #[test]
+    fn rejects_parse_errors_instead_of_returning_partial_coverage() {
+        let path = PathBuf::from("broken.ts");
+        let extractor = ImportExtractor::new(&path, "function broken( {");
+        assert!(extractor.extract().is_err());
     }
 }

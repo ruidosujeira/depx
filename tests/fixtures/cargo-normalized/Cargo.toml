@@ -1,0 +1,10 @@
+[package]
+name = "cargo-normalized-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+foo = "2"
+
+[dev-dependencies]
+test-helper = "1"
