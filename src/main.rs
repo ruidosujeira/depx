@@ -306,6 +306,15 @@ async fn run_duplicates(path: &Path, verbose: bool, json: bool) -> Result<()> {
         reporter.report_duplicates(&analysis);
     }
 
+    // Exit non-zero on high-severity duplicates (3+ versions of a crate) so the
+    // command can gate a CI step. Lower severities are informational and keep a
+    // zero exit. Flush first since `exit` skips stdout's buffer teardown.
+    if analysis.stats.high_severity > 0 {
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        std::process::exit(1);
+    }
+
     Ok(())
 }
 
