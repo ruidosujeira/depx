@@ -6,7 +6,7 @@ use miette::{Context, IntoDiagnostic, Result};
 use serde::Deserialize;
 
 use crate::analysis::{AnalysisCoverage, CoverageArea, CoverageLimitation};
-use crate::analyzer::{ImportAnalyzer, RustAnalyzer, RustReference};
+use crate::analyzer::{ImportAnalyzer, RustAnalyzer, RustReference, RustReferenceScope};
 use crate::model::{
     Component, ComponentId, DependencyEdge, Ecosystem, ProjectSnapshot, ProjectUnitId,
 };
@@ -104,7 +104,7 @@ pub fn collect_project_evidence(snapshot: ProjectSnapshot) -> Result<EvidenceCol
         let references = RustAnalyzer::new(&snapshot.root)
             .with_allowed_project_roots(project_roots)
             .analyze()?;
-        let (source_evidence, unresolved_references) =
+        let (source_evidence, resolution_gaps) =
             collect_rust_source(&snapshot, references.references())?;
         evidence.extend(source_evidence);
         let mut limitations = vec![
@@ -112,8 +112,11 @@ pub fn collect_project_evidence(snapshot: ProjectSnapshot) -> Result<EvidenceCol
             CoverageLimitation::RustMacroExpansion,
             CoverageLimitation::GeneratedSourceCode,
         ];
-        if unresolved_references {
+        if resolution_gaps.unresolved_external {
             limitations.push(CoverageLimitation::UnresolvedPackageReferences);
+        }
+        if resolution_gaps.unclassified {
+            limitations.push(CoverageLimitation::UnclassifiedRustReferences);
         }
         (
             references.total_references(),
@@ -143,9 +146,9 @@ pub fn collect_project_evidence(snapshot: ProjectSnapshot) -> Result<EvidenceCol
 fn collect_rust_source<'a>(
     snapshot: &ProjectSnapshot,
     references: impl Iterator<Item = &'a RustReference>,
-) -> Result<(Vec<Evidence>, bool)> {
+) -> Result<(Vec<Evidence>, RustResolutionGaps)> {
     let mut evidence = Vec::new();
-    let unresolved = false;
+    let mut gaps = RustResolutionGaps::default();
     for reference in references {
         let relative = relative_path(&snapshot.root, &reference.file_path);
         let owner = snapshot
@@ -153,10 +156,16 @@ fn collect_rust_source<'a>(
             .map(|unit| unit.id.clone());
         let candidates = resolve_unit_candidates(snapshot, owner.as_ref(), &reference.identifier);
         if candidates.is_empty() {
-            // The conservative Rust scanner also sees local modules/workspace
-            // crates, which are intentionally absent from the third-party
-            // component inventory. Only resolved unit declarations become
-            // dependency evidence.
+            if reference.scope == RustReferenceScope::ExplicitLocal
+                || is_workspace_crate(snapshot, &reference.identifier)
+            {
+                continue;
+            }
+            match reference.scope {
+                RustReferenceScope::ExplicitExternal => gaps.unresolved_external = true,
+                RustReferenceScope::Unclassified => gaps.unclassified = true,
+                RustReferenceScope::ExplicitLocal => unreachable!(),
+            }
             continue;
         }
         let role = classify_rust_source_role(&relative);
@@ -178,7 +187,23 @@ fn collect_rust_source<'a>(
             Confidence::Medium,
         )?);
     }
-    Ok((evidence, unresolved))
+    Ok((evidence, gaps))
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RustResolutionGaps {
+    unresolved_external: bool,
+    unclassified: bool,
+}
+
+fn is_workspace_crate(snapshot: &ProjectSnapshot, identifier: &str) -> bool {
+    snapshot.units.iter().any(|unit| {
+        unit.name
+            .as_deref()
+            .map(|name| name.replace('-', "_"))
+            .as_deref()
+            == Some(identifier)
+    })
 }
 
 fn classify_rust_source_role(path: &Path) -> SourceRole {
@@ -528,6 +553,10 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cargo-normalized")
     }
 
+    fn cargo_resolution_gaps_fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cargo-resolution-gaps")
+    }
+
     fn cargo_workspace_fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cargo-workspace")
     }
@@ -779,6 +808,126 @@ mod tests {
     }
 
     #[test]
+    fn declared_rust_crate_resolves_to_exact_component_evidence() {
+        let snapshot = CargoAdapter
+            .build_snapshot(&cargo_resolution_gaps_fixture())
+            .unwrap();
+        let collection = collect_project_evidence(snapshot).unwrap();
+        let evidence = collection
+            .snapshot
+            .evidence
+            .iter()
+            .find(|evidence| {
+                evidence.subject.name == "actual-dep"
+                    && evidence.kind == EvidenceKind::RustCrateReference
+            })
+            .unwrap();
+
+        assert_eq!(evidence.subject.version, "1.0.0");
+        assert_eq!(evidence.resolution, EvidenceResolution::Exact);
+        assert_eq!(
+            evidence.owner.as_ref().map(ProjectUnitId::as_str),
+            Some("unit:.")
+        );
+    }
+
+    #[test]
+    fn cargo_alias_resolves_without_becoming_uncertain() {
+        let snapshot = CargoAdapter
+            .build_snapshot(&cargo_resolution_gaps_fixture())
+            .unwrap();
+        let collection = collect_project_evidence(snapshot).unwrap();
+        let evidence = collection
+            .snapshot
+            .evidence
+            .iter()
+            .find(|evidence| {
+                evidence.subject.name == "aliased-dep"
+                    && evidence.kind == EvidenceKind::RustCrateReference
+            })
+            .unwrap();
+
+        assert_eq!(evidence.subject.version, "2.0.0");
+        assert_eq!(evidence.resolution, EvidenceResolution::Exact);
+    }
+
+    #[test]
+    fn local_rust_module_does_not_create_evidence_or_a_coverage_gap() {
+        let snapshot = CargoAdapter
+            .build_snapshot(&cargo_resolution_gaps_fixture())
+            .unwrap();
+        let collection = collect_project_evidence(snapshot).unwrap();
+
+        assert!(!collection.snapshot.evidence.iter().any(|evidence| {
+            evidence.kind == EvidenceKind::RustCrateReference
+                && evidence
+                    .origin
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| description.contains("identifier local"))
+        }));
+        assert!(!collection
+            .coverage
+            .not_checked
+            .contains(&CoverageLimitation::UnclassifiedRustReferences));
+    }
+
+    #[test]
+    fn explicit_unresolved_rust_crate_is_a_coverage_limitation() {
+        let snapshot = CargoAdapter
+            .build_snapshot(&cargo_resolution_gaps_fixture())
+            .unwrap();
+        let collection = collect_project_evidence(snapshot).unwrap();
+
+        assert!(collection
+            .coverage
+            .not_checked
+            .contains(&CoverageLimitation::UnresolvedPackageReferences));
+        assert!(!collection.snapshot.evidence.iter().any(|evidence| {
+            evidence.kind == EvidenceKind::RustCrateReference
+                && evidence
+                    .origin
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| description.contains("unresolved_external"))
+        }));
+    }
+
+    #[test]
+    fn syntactically_uncertain_rust_path_is_preserved_as_uncertainty() {
+        let snapshot = CargoAdapter.build_snapshot(&cargo_fixture()).unwrap();
+        let reference = RustReference {
+            file_path: cargo_fixture().join("src/lib.rs"),
+            identifier: "maybe_local_or_external".to_string(),
+            span: crate::evidence::SourceSpan {
+                offset: 0,
+                length: 23,
+            },
+            scope: RustReferenceScope::Unclassified,
+        };
+
+        let (evidence, gaps) = collect_rust_source(&snapshot, [&reference].into_iter()).unwrap();
+        assert!(evidence.is_empty());
+        assert!(!gaps.unresolved_external);
+        assert!(gaps.unclassified);
+    }
+
+    #[test]
+    fn rust_gap_classification_is_deterministic() {
+        let collect = || {
+            let snapshot = CargoAdapter
+                .build_snapshot(&cargo_resolution_gaps_fixture())
+                .unwrap();
+            collect_project_evidence(snapshot).unwrap()
+        };
+        let first = collect();
+        let second = collect();
+
+        assert_eq!(first.coverage, second.coverage);
+        assert_eq!(first.snapshot.evidence, second.snapshot.evidence);
+    }
+
+    #[test]
     fn rust_workspace_source_references_resolve_member_aliases() {
         let snapshot = CargoAdapter
             .build_snapshot(&cargo_workspace_fixture())
@@ -807,5 +956,20 @@ mod tests {
             .coverage
             .not_checked
             .contains(&CoverageLimitation::UnresolvedPackageReferences));
+        for evidence in collection
+            .snapshot
+            .evidence
+            .iter()
+            .filter(|evidence| evidence.kind == EvidenceKind::RustCrateReference)
+        {
+            let owner = collection
+                .snapshot
+                .unit(evidence.owner.as_ref().unwrap())
+                .unwrap();
+            assert!(owner
+                .declarations
+                .iter()
+                .any(|declaration| declaration.component == evidence.subject));
+        }
     }
 }

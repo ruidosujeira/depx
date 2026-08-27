@@ -7,7 +7,8 @@ use serde::Deserialize;
 use serde_yaml_ng::{Mapping, Value};
 
 use crate::model::{
-    Component, ComponentId, DependencyEdge, DependencyKind, Ecosystem, ProjectSnapshot,
+    Component, ComponentId, DependencyEdge, DependencyKind, Ecosystem, PackageManager,
+    ProjectSnapshot,
 };
 
 use super::javascript::{
@@ -161,7 +162,9 @@ fn build_snapshot(
     }
 
     let units = project_units(&manifests, &declarations);
-    ProjectSnapshot::new(root.to_path_buf(), components, edges).with_units(units)
+    ProjectSnapshot::new(root.to_path_buf(), components, edges)
+        .with_units(units)?
+        .with_package_manager(PackageManager::Pnpm)
 }
 
 fn resolve_declarations(

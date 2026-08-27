@@ -1,0 +1,19 @@
+version = 3
+
+[[package]]
+name = "cargo-resolution-gaps"
+version = "0.1.0"
+dependencies = [
+ "actual-dep",
+ "aliased-dep",
+]
+
+[[package]]
+name = "actual-dep"
+version = "1.0.0"
+source = "registry+https://example.invalid/index"
+
+[[package]]
+name = "aliased-dep"
+version = "2.0.0"
+source = "registry+https://example.invalid/index"

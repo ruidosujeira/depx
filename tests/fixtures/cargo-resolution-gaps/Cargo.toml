@@ -1,0 +1,8 @@
+[package]
+name = "cargo-resolution-gaps"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+actual-dep = "1"
+alias_dep = { package = "aliased-dep", version = "2" }

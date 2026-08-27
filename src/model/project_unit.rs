@@ -7,6 +7,25 @@ use crate::evidence::ManifestSection;
 
 use super::{ComponentId, Ecosystem};
 
+/// Package manager that produced a normalized project snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageManager {
+    Npm,
+    Pnpm,
+    Yarn,
+    Cargo,
+}
+
+impl PackageManager {
+    pub fn ecosystem(self) -> Ecosystem {
+        match self {
+            Self::Npm | Self::Pnpm | Self::Yarn => Ecosystem::Npm,
+            Self::Cargo => Ecosystem::Cargo,
+        }
+    }
+}
+
 /// Stable identity of one manifest-owned project or workspace member.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ProjectUnitId(String);
@@ -40,6 +59,8 @@ pub struct UnitDeclaration {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ProjectUnit {
     pub id: ProjectUnitId,
+    /// Package/workspace name from the owning manifest, when present.
+    pub name: Option<String>,
     /// Directory relative to the snapshot root. The root unit uses an empty path.
     pub root: PathBuf,
     /// Manifest path relative to the snapshot root.
@@ -59,11 +80,17 @@ impl ProjectUnit {
         declarations.dedup();
         Self {
             id: ProjectUnitId::from_root(&root),
+            name: None,
             root,
             manifest,
             ecosystem,
             declarations,
         }
+    }
+
+    pub fn with_name(mut self, name: Option<String>) -> Self {
+        self.name = name;
+        self
     }
 
     pub(crate) fn validate_paths(&self) -> Result<()> {
@@ -77,6 +104,13 @@ impl ProjectUnit {
         }
         if self.id != ProjectUnitId::from_root(&self.root) {
             bail!("Project unit identity does not match its normalized root");
+        }
+        if self
+            .name
+            .as_ref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            bail!("Project unit package name must not be empty");
         }
         Ok(())
     }

@@ -26,6 +26,7 @@ pub enum CoverageLimitation {
     UnsupportedConfigurationFormats,
     PackageBinaryAliases,
     UnresolvedPackageReferences,
+    UnclassifiedRustReferences,
     RustConditionalCompilation,
     RustMacroExpansion,
     GeneratedSourceCode,

@@ -5,7 +5,8 @@ use miette::{Context, IntoDiagnostic, Result};
 use serde::Deserialize;
 
 use crate::model::{
-    Component, ComponentId, DependencyEdge, DependencyKind, Ecosystem, ProjectSnapshot,
+    Component, ComponentId, DependencyEdge, DependencyKind, Ecosystem, PackageManager,
+    ProjectSnapshot,
 };
 
 use super::javascript::{
@@ -223,7 +224,9 @@ fn finish_snapshot(
     edges: Vec<DependencyEdge>,
     units: Vec<crate::model::ProjectUnit>,
 ) -> Result<ProjectSnapshot> {
-    ProjectSnapshot::new(root.to_path_buf(), components, edges).with_units(units)
+    ProjectSnapshot::new(root.to_path_buf(), components, edges)
+        .with_units(units)?
+        .with_package_manager(PackageManager::Npm)
 }
 
 struct V1Record<'a> {

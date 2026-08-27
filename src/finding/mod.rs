@@ -8,7 +8,7 @@ pub use catalog::{is_known_code, metadata};
 pub use engine::{analyze_project, ProjectAnalysis};
 pub use model::{
     DuplicateKind, Finding, FindingDetails, FindingSeverity, Recommendation, RecommendationAction,
-    RuleCode, FINDING_SCHEMA_VERSION,
+    RuleCode,
 };
 pub use validation::validate_analysis;
 

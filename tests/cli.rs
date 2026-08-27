@@ -88,8 +88,14 @@ fn analysis_json_exposes_versioned_project_units() {
         .unwrap();
     assert!(output.status.success());
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["schemaVersion"], 2);
+    assert_eq!(value["schemaVersion"], 3);
+    assert_ne!(value["schemaVersion"], 2);
     assert_eq!(value["units"].as_array().unwrap().len(), 2);
+    assert!(value["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|unit| unit["name"].is_string()));
     assert!(value["evidence"]
         .as_array()
         .unwrap()
