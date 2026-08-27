@@ -6,8 +6,10 @@ use miette::{Context, IntoDiagnostic, Result};
 use serde::Deserialize;
 
 use crate::analysis::{AnalysisCoverage, CoverageArea, CoverageLimitation};
-use crate::analyzer::ImportAnalyzer;
-use crate::model::{Component, ComponentId, DependencyEdge, Ecosystem, ProjectSnapshot};
+use crate::analyzer::{ImportAnalyzer, RustAnalyzer, RustReference};
+use crate::model::{
+    Component, ComponentId, DependencyEdge, Ecosystem, ProjectSnapshot, ProjectUnitId,
+};
 use crate::types::{Import, ImportKind};
 
 use super::classify_source_role;
@@ -29,12 +31,39 @@ pub struct EvidenceCollection {
 pub fn collect_project_evidence(snapshot: ProjectSnapshot) -> Result<EvidenceCollection> {
     snapshot.validate()?;
     let ecosystem = snapshot
-        .components
+        .units
         .first()
-        .map(|component| component.id.ecosystem);
-    let mut evidence = Vec::new();
+        .map(|unit| unit.ecosystem)
+        .or_else(|| {
+            snapshot
+                .components
+                .first()
+                .map(|component| component.id.ecosystem)
+        })
+        .or_else(|| {
+            snapshot
+                .root
+                .join("package-lock.json")
+                .is_file()
+                .then_some(Ecosystem::Npm)
+        })
+        .or_else(|| {
+            snapshot
+                .root
+                .join("Cargo.lock")
+                .is_file()
+                .then_some(Ecosystem::Cargo)
+        });
+    let mut evidence = structural_evidence(&snapshot)?;
     let (source_references, files_analyzed, coverage) = if ecosystem == Some(Ecosystem::Npm) {
-        let imports = ImportAnalyzer::new(&snapshot.root).analyze()?;
+        let project_roots = snapshot
+            .units
+            .iter()
+            .map(|unit| snapshot.root.join(&unit.root))
+            .collect();
+        let imports = ImportAnalyzer::new(&snapshot.root)
+            .with_allowed_project_roots(project_roots)
+            .analyze()?;
         let (source_evidence, unresolved_imports) = collect_source(&snapshot, imports.imports())?;
         evidence.extend(source_evidence);
         evidence.extend(collect_scripts(&snapshot)?);
@@ -66,18 +95,41 @@ pub fn collect_project_evidence(snapshot: ProjectSnapshot) -> Result<EvidenceCol
                 limitations,
             ),
         )
-    } else {
+    } else if ecosystem == Some(Ecosystem::Cargo) {
+        let project_roots = snapshot
+            .units
+            .iter()
+            .map(|unit| snapshot.root.join(&unit.root))
+            .collect();
+        let references = RustAnalyzer::new(&snapshot.root)
+            .with_allowed_project_roots(project_roots)
+            .analyze()?;
+        let (source_evidence, unresolved_references) =
+            collect_rust_source(&snapshot, references.references())?;
+        evidence.extend(source_evidence);
+        let mut limitations = vec![
+            CoverageLimitation::RustConditionalCompilation,
+            CoverageLimitation::RustMacroExpansion,
+            CoverageLimitation::GeneratedSourceCode,
+        ];
+        if unresolved_references {
+            limitations.push(CoverageLimitation::UnresolvedPackageReferences);
+        }
         (
-            0,
-            0,
+            references.total_references(),
+            references.files_analyzed(),
             AnalysisCoverage::new(
                 vec![
                     CoverageArea::ManifestDeclarations,
                     CoverageArea::DependencyGraph,
+                    CoverageArea::RustCrateReferences,
+                    CoverageArea::TestFiles,
                 ],
-                vec![CoverageLimitation::RustSourceUsage],
+                limitations,
             ),
         )
+    } else {
+        (0, 0, AnalysisCoverage::new(Vec::new(), Vec::new()))
     };
     let snapshot = snapshot.with_evidence(evidence)?;
     Ok(EvidenceCollection {
@@ -86,6 +138,66 @@ pub fn collect_project_evidence(snapshot: ProjectSnapshot) -> Result<EvidenceCol
         source_references,
         files_analyzed,
     })
+}
+
+fn collect_rust_source<'a>(
+    snapshot: &ProjectSnapshot,
+    references: impl Iterator<Item = &'a RustReference>,
+) -> Result<(Vec<Evidence>, bool)> {
+    let mut evidence = Vec::new();
+    let unresolved = false;
+    for reference in references {
+        let relative = relative_path(&snapshot.root, &reference.file_path);
+        let owner = snapshot
+            .owner_for_path(&relative)
+            .map(|unit| unit.id.clone());
+        let candidates = resolve_unit_candidates(snapshot, owner.as_ref(), &reference.identifier);
+        if candidates.is_empty() {
+            // The conservative Rust scanner also sees local modules/workspace
+            // crates, which are intentionally absent from the third-party
+            // component inventory. Only resolved unit declarations become
+            // dependency evidence.
+            continue;
+        }
+        let role = classify_rust_source_role(&relative);
+        evidence.extend(evidence_for_candidates(
+            owner,
+            candidates,
+            EvidenceKind::RustCrateReference,
+            EvidenceOrigin {
+                path: relative,
+                span: Some(reference.span),
+                description: Some(format!(
+                    "references Rust crate identifier {}",
+                    reference.identifier
+                )),
+            },
+            role,
+            // This collector resolves syntax without executing cfg expansion or
+            // macros, so retain medium confidence even for a unique component.
+            Confidence::Medium,
+        )?);
+    }
+    Ok((evidence, unresolved))
+}
+
+fn classify_rust_source_role(path: &Path) -> SourceRole {
+    if path.file_name().and_then(|name| name.to_str()) == Some("build.rs") {
+        return SourceRole::Build;
+    }
+    if path
+        .components()
+        .any(|component| matches!(component.as_os_str().to_str(), Some("tests" | "benches")))
+    {
+        return SourceRole::Test;
+    }
+    if path
+        .components()
+        .any(|component| component.as_os_str().to_str() == Some("examples"))
+    {
+        return SourceRole::Development;
+    }
+    SourceRole::Runtime
 }
 
 fn collect_source<'a>(
@@ -98,12 +210,15 @@ fn collect_source<'a>(
         let Some(name) = &import.resolved_package else {
             continue;
         };
-        let candidates = resolve_candidates(&snapshot.components, name);
+        let relative = relative_path(&snapshot.root, &import.file_path);
+        let owner = snapshot
+            .owner_for_path(&relative)
+            .map(|unit| unit.id.clone());
+        let candidates = resolve_unit_candidates(snapshot, owner.as_ref(), name);
         if candidates.is_empty() {
             unresolved = true;
             continue;
         }
-        let relative = relative_path(&snapshot.root, &import.file_path);
         let role = classify_source_role(&relative);
         let kind = if role == SourceRole::Configuration {
             EvidenceKind::ConfigurationReference
@@ -131,58 +246,76 @@ fn collect_source<'a>(
             Confidence::Medium
         };
         evidence.extend(evidence_for_candidates(
-            candidates, kind, origin, role, confidence,
+            owner, candidates, kind, origin, role, confidence,
         )?);
     }
     Ok((evidence, unresolved))
 }
 
 fn collect_scripts(snapshot: &ProjectSnapshot) -> Result<Vec<Evidence>> {
-    let path = snapshot.root.join("package.json");
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = fs::read_to_string(&path)
-        .into_diagnostic()
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    let manifest: ScriptManifest = serde_json::from_str(&content)
-        .into_diagnostic()
-        .wrap_err("Failed to parse package.json scripts")?;
-    let direct: Vec<_> = snapshot
-        .components
-        .iter()
-        .filter(|component| component.direct)
-        .collect();
     let mut evidence = Vec::new();
-    for (script, command) in manifest.scripts {
-        for executable in extract_script_commands(&command) {
-            let candidates: Vec<_> = direct
-                .iter()
-                .copied()
-                .filter(|component| binary_names(&component.id.name).contains(&executable.as_str()))
-                .map(|component| component.id.clone())
-                .collect();
-            if candidates.is_empty() {
-                continue;
+    for unit in &snapshot.units {
+        let path = snapshot.root.join(&unit.manifest);
+        let content = fs::read_to_string(&path)
+            .into_diagnostic()
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let manifest: ScriptManifest = serde_json::from_str(&content)
+            .into_diagnostic()
+            .with_context(|| format!("Failed to parse {} scripts", path.display()))?;
+        for (script, command) in manifest.scripts {
+            for executable in extract_script_commands(&command) {
+                let mut candidates: Vec<_> = unit
+                    .declarations
+                    .iter()
+                    .filter(|declaration| {
+                        binary_names(&declaration.component.name).contains(&executable.as_str())
+                    })
+                    .map(|declaration| declaration.component.clone())
+                    .collect();
+                candidates.sort();
+                candidates.dedup();
+                if candidates.is_empty() {
+                    continue;
+                }
+                let kind = EvidenceKind::PackageScript {
+                    script: script.clone(),
+                };
+                let origin = EvidenceOrigin {
+                    path: unit.manifest.clone(),
+                    span: None,
+                    description: Some(format!("scripts.{script} invokes {executable}: {command}")),
+                };
+                evidence.extend(evidence_for_candidates(
+                    Some(unit.id.clone()),
+                    candidates,
+                    kind,
+                    origin,
+                    script_role(&script),
+                    Confidence::High,
+                )?);
             }
-            let kind = EvidenceKind::PackageScript {
-                script: script.clone(),
-            };
-            let origin = EvidenceOrigin {
-                path: PathBuf::from("package.json"),
-                span: None,
-                description: Some(format!("scripts.{script} invokes {executable}: {command}")),
-            };
-            evidence.extend(evidence_for_candidates(
-                candidates,
-                kind,
-                origin,
-                script_role(&script),
-                Confidence::High,
-            )?);
         }
     }
     Ok(evidence)
+}
+
+fn resolve_unit_candidates(
+    snapshot: &ProjectSnapshot,
+    owner: Option<&ProjectUnitId>,
+    name: &str,
+) -> Vec<ComponentId> {
+    if let Some(unit) = owner.and_then(|owner| snapshot.unit(owner)) {
+        let mut ids: Vec<_> = unit
+            .declarations
+            .iter()
+            .filter(|declaration| declaration.name == name)
+            .map(|declaration| declaration.component.clone())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        return ids;
+    }
+    resolve_candidates(&snapshot.components, name)
 }
 
 fn resolve_candidates(components: &[Component], name: &str) -> Vec<ComponentId> {
@@ -205,6 +338,7 @@ fn resolve_candidates(components: &[Component], name: &str) -> Vec<ComponentId> 
 }
 
 fn evidence_for_candidates(
+    owner: Option<ProjectUnitId>,
     candidates: Vec<ComponentId>,
     kind: EvidenceKind,
     origin: EvidenceOrigin,
@@ -212,29 +346,50 @@ fn evidence_for_candidates(
     exact_confidence: Confidence,
 ) -> Result<Vec<Evidence>> {
     if candidates.len() == 1 {
-        return Ok(vec![Evidence::new(
-            candidates[0].clone(),
-            kind,
-            origin,
-            role,
-            exact_confidence,
-            EvidenceResolution::Exact,
-        )?]);
+        let evidence = match owner {
+            Some(owner) => Evidence::new_for_unit(
+                owner,
+                candidates[0].clone(),
+                kind,
+                origin,
+                role,
+                exact_confidence,
+                EvidenceResolution::Exact,
+            ),
+            None => Evidence::new(
+                candidates[0].clone(),
+                kind,
+                origin,
+                role,
+                exact_confidence,
+                EvidenceResolution::Exact,
+            ),
+        }?;
+        return Ok(vec![evidence]);
     }
     let resolution = EvidenceResolution::Ambiguous {
         candidates: candidates.clone(),
     };
     candidates
         .into_iter()
-        .map(|subject| {
-            Evidence::new(
+        .map(|subject| match &owner {
+            Some(owner) => Evidence::new_for_unit(
+                owner.clone(),
                 subject,
                 kind.clone(),
                 origin.clone(),
                 role,
                 Confidence::Low,
                 resolution.clone(),
-            )
+            ),
+            None => Evidence::new(
+                subject,
+                kind.clone(),
+                origin.clone(),
+                role,
+                Confidence::Low,
+                resolution.clone(),
+            ),
         })
         .collect()
 }
@@ -272,6 +427,32 @@ fn relative_path(root: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(root).unwrap_or(path).to_path_buf()
 }
 
+fn structural_evidence(snapshot: &ProjectSnapshot) -> Result<Vec<Evidence>> {
+    let mut evidence = Vec::new();
+    for unit in &snapshot.units {
+        for declaration in &unit.declarations {
+            evidence.push(manifest_evidence(
+                unit.id.clone(),
+                declaration.component.clone(),
+                unit.manifest.clone(),
+                declaration.section,
+            )?);
+        }
+    }
+    let lockfile = match snapshot.units.first().map(|unit| unit.ecosystem) {
+        Some(Ecosystem::Cargo) => PathBuf::from("Cargo.lock"),
+        Some(Ecosystem::Npm) if snapshot.root.join("pnpm-lock.yaml").is_file() => {
+            PathBuf::from("pnpm-lock.yaml")
+        }
+        Some(Ecosystem::Npm) if snapshot.root.join("yarn.lock").is_file() => {
+            PathBuf::from("yarn.lock")
+        }
+        _ => PathBuf::from("package-lock.json"),
+    };
+    evidence.extend(transitive_evidence(&snapshot.dependency_edges, lockfile)?);
+    Ok(evidence)
+}
+
 #[derive(Deserialize, Default)]
 struct ScriptManifest {
     #[serde(default)]
@@ -280,6 +461,7 @@ struct ScriptManifest {
 
 /// Create exact declaration evidence inside an ecosystem adapter.
 pub(crate) fn manifest_evidence(
+    owner: crate::model::ProjectUnitId,
     subject: ComponentId,
     path: PathBuf,
     section: ManifestSection,
@@ -289,7 +471,8 @@ pub(crate) fn manifest_evidence(
         ManifestSection::BuildDependencies => SourceRole::Build,
         _ => SourceRole::Unknown,
     };
-    Evidence::new(
+    Evidence::new_for_unit(
+        owner,
         subject,
         EvidenceKind::ManifestDeclaration { section },
         EvidenceOrigin {
@@ -334,11 +517,23 @@ pub(crate) fn transitive_evidence(
 mod tests {
     use super::*;
     use crate::analysis::{assess_usage, UsageState};
-    use crate::ecosystem::{EcosystemAdapter, NpmAdapter};
+    use crate::ecosystem::{CargoAdapter, EcosystemAdapter, NpmAdapter};
     use crate::model::{Component, Ecosystem};
 
     fn fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/npm-evidence")
+    }
+
+    fn cargo_fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cargo-normalized")
+    }
+
+    fn cargo_workspace_fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cargo-workspace")
+    }
+
+    fn npm_workspace_context_fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/npm-workspace-context")
     }
 
     fn collected() -> EvidenceCollection {
@@ -385,6 +580,52 @@ mod tests {
         assert!(has("vitest", |evidence| {
             evidence.kind == EvidenceKind::StaticImport && evidence.role == SourceRole::Test
         }));
+    }
+
+    #[test]
+    fn workspace_imports_resolve_within_their_exact_unit_context() {
+        let snapshot = NpmAdapter
+            .build_snapshot(&npm_workspace_context_fixture())
+            .unwrap();
+        let collection = collect_project_evidence(snapshot).unwrap();
+        let shared: Vec<_> = collection
+            .snapshot
+            .evidence
+            .iter()
+            .filter(|evidence| {
+                evidence.subject.name == "shared" && evidence.kind == EvidenceKind::StaticImport
+            })
+            .collect();
+        assert_eq!(shared.len(), 2);
+        assert!(shared
+            .iter()
+            .all(|evidence| evidence.resolution == EvidenceResolution::Exact));
+        for evidence in shared {
+            let owner = collection
+                .snapshot
+                .unit(evidence.owner.as_ref().unwrap())
+                .unwrap();
+            let expected_location = format!(
+                "{}/node_modules/shared",
+                owner.root.to_string_lossy().replace('\\', "/")
+            );
+            assert_eq!(
+                evidence.subject.location.as_deref(),
+                Some(expected_location.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_nested_javascript_projects_are_not_scanned() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/npm-workspace");
+        let collection =
+            collect_project_evidence(NpmAdapter.build_snapshot(&root).unwrap()).unwrap();
+        assert!(collection
+            .snapshot
+            .evidence
+            .iter()
+            .all(|evidence| { !evidence.origin.path.starts_with("unrelated") }));
     }
 
     #[test]
@@ -495,5 +736,76 @@ mod tests {
             serde_json::to_string(&assess_usage(&first.snapshot).unwrap()).unwrap(),
             serde_json::to_string(&assess_usage(&second.snapshot).unwrap()).unwrap()
         );
+    }
+
+    #[test]
+    fn rust_crate_references_are_role_aware_usage_evidence() {
+        let snapshot = CargoAdapter.build_snapshot(&cargo_fixture()).unwrap();
+        let collection = collect_project_evidence(snapshot).unwrap();
+        assert!(collection
+            .coverage
+            .checked
+            .contains(&CoverageArea::RustCrateReferences));
+        assert!(collection.snapshot.evidence.iter().any(|evidence| {
+            evidence.subject.name == "foo"
+                && evidence.kind == EvidenceKind::RustCrateReference
+                && evidence.role == SourceRole::Runtime
+                && evidence.origin.span.is_some()
+        }));
+        assert!(collection.snapshot.evidence.iter().any(|evidence| {
+            evidence.subject.name == "test-helper"
+                && evidence.kind == EvidenceKind::RustCrateReference
+                && evidence.role == SourceRole::Test
+        }));
+
+        let assessments = assess_usage(&collection.snapshot).unwrap();
+        assert_eq!(
+            assessments
+                .iter()
+                .find(|assessment| assessment.component.name == "foo"
+                    && assessment.component.version == "2.0.0")
+                .unwrap()
+                .state,
+            UsageState::ConfirmedRuntime
+        );
+        assert_eq!(
+            assessments
+                .iter()
+                .find(|assessment| assessment.component.name == "test-helper")
+                .unwrap()
+                .state,
+            UsageState::ConfirmedTest
+        );
+    }
+
+    #[test]
+    fn rust_workspace_source_references_resolve_member_aliases() {
+        let snapshot = CargoAdapter
+            .build_snapshot(&cargo_workspace_fixture())
+            .unwrap();
+        let collection = collect_project_evidence(snapshot).unwrap();
+        assert!(collection.snapshot.evidence.iter().any(|evidence| {
+            evidence.subject.name == "anyhow"
+                && evidence.kind == EvidenceKind::RustCrateReference
+                && evidence.origin.path == Path::new("crates/app/src/lib.rs")
+        }));
+        assert!(collection.snapshot.evidence.iter().any(|evidence| {
+            evidence.subject.name == "pretty_assertions"
+                && evidence.kind == EvidenceKind::RustCrateReference
+                && evidence.role == SourceRole::Test
+        }));
+        assert!(collection.snapshot.evidence.iter().any(|evidence| {
+            evidence.subject.name == "yansi"
+                && evidence.kind == EvidenceKind::RustCrateReference
+                && evidence.origin.path == Path::new("internal/shared/src/lib.rs")
+        }));
+        assert!(!collection.snapshot.evidence.iter().any(|evidence| {
+            evidence.kind == EvidenceKind::RustCrateReference
+                && evidence.origin.path.starts_with("nested-fixture")
+        }));
+        assert!(!collection
+            .coverage
+            .not_checked
+            .contains(&CoverageLimitation::UnresolvedPackageReferences));
     }
 }

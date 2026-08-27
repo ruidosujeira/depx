@@ -5,7 +5,6 @@ mod scripts;
 
 pub use classify::classify_source_role;
 pub use collector::collect_project_evidence;
-pub(crate) use collector::{manifest_evidence, transitive_evidence};
 pub use model::{
     Confidence, Evidence, EvidenceId, EvidenceKind, EvidenceOrigin, EvidenceResolution,
     ManifestSection, SourceRole, SourceSpan,

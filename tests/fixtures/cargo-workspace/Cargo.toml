@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/*"]
+exclude = ["crates/excluded"]
+resolver = "2"
+
+[workspace.dependencies]
+serde = "1"
+anyhow = "1"

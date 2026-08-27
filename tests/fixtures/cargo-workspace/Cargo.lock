@@ -1,0 +1,41 @@
+version = 3
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "shared",
+]
+
+[[package]]
+name = "tool"
+version = "0.1.0"
+dependencies = ["pretty_assertions"]
+
+[[package]]
+name = "anyhow"
+version = "1.0.99"
+source = "registry+https://example.invalid/index"
+
+[[package]]
+name = "pretty_assertions"
+version = "1.4.1"
+source = "registry+https://example.invalid/index"
+dependencies = ["yansi"]
+
+[[package]]
+name = "serde"
+version = "1.0.219"
+source = "registry+https://example.invalid/index"
+
+[[package]]
+name = "shared"
+version = "0.1.0"
+dependencies = ["yansi"]
+
+[[package]]
+name = "yansi"
+version = "1.0.1"
+source = "registry+https://example.invalid/index"

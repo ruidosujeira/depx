@@ -4,7 +4,7 @@ mod model;
 pub(crate) mod rules;
 mod validation;
 
-pub use catalog::metadata;
+pub use catalog::{is_known_code, metadata};
 pub use engine::{analyze_project, ProjectAnalysis};
 pub use model::{
     DuplicateKind, Finding, FindingDetails, FindingSeverity, Recommendation, RecommendationAction,

@@ -378,12 +378,48 @@ mod tests {
             subject,
             "changed wording".to_string(),
             "changed explanation".to_string(),
-            first.findings[0].evidence.clone(),
+            Vec::new(),
             first.findings[0].recommendation.clone(),
             first.findings[0].details.clone(),
         )
         .unwrap();
         assert_eq!(same.id.as_str(), original_id);
+    }
+
+    #[test]
+    fn finding_identity_survives_source_span_offset_changes() {
+        let subject = id(
+            Ecosystem::Npm,
+            "configured",
+            "1.0.0",
+            "node_modules/configured",
+        );
+        let analyze_at = |offset| {
+            let source = Evidence::new(
+                subject.clone(),
+                EvidenceKind::ConfigurationReference,
+                EvidenceOrigin {
+                    path: "vite.config.ts".into(),
+                    span: Some(crate::evidence::SourceSpan { offset, length: 10 }),
+                    description: Some("references configured".to_string()),
+                },
+                SourceRole::Configuration,
+                Confidence::High,
+                EvidenceResolution::Exact,
+            )
+            .unwrap();
+            analyze(
+                vec![component(subject.clone(), true)],
+                Vec::new(),
+                vec![manifest(&subject), source],
+            )
+        };
+        let first = analyze_at(4);
+        let shifted = analyze_at(400);
+        let first = findings(&first, "DX003")[0];
+        let shifted = findings(&shifted, "DX003")[0];
+        assert_ne!(first.evidence, shifted.evidence);
+        assert_eq!(first.id, shifted.id);
     }
 
     #[test]

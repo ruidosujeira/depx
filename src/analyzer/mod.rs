@@ -1,4 +1,5 @@
 mod extractor;
+mod rust;
 
 use std::path::{Path, PathBuf};
 
@@ -8,17 +9,28 @@ use miette::{Context, IntoDiagnostic, Result};
 use crate::types::ImportMap;
 
 pub use extractor::ImportExtractor;
+pub use rust::{RustAnalyzer, RustReference};
 
 /// Analyzes JavaScript/TypeScript source files to extract imports
 pub struct ImportAnalyzer {
     root: PathBuf,
+    allowed_project_roots: Vec<PathBuf>,
 }
 
 impl ImportAnalyzer {
     pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
+            allowed_project_roots: Vec::new(),
         }
+    }
+
+    /// Restrict nested package projects to declared workspace/unit roots.
+    pub fn with_allowed_project_roots(mut self, mut roots: Vec<PathBuf>) -> Self {
+        roots.sort();
+        roots.dedup();
+        self.allowed_project_roots = roots;
+        self
     }
 
     /// Analyze all JS/TS files in the project and extract imports
@@ -26,20 +38,27 @@ impl ImportAnalyzer {
         let mut import_map = ImportMap::new();
 
         // Walk the directory, respecting .gitignore
+        let boundary_root = self.root.clone();
+        let allowed_project_roots = self.allowed_project_roots.clone();
         let walker = WalkBuilder::new(&self.root)
             .hidden(true) // Skip hidden files
             .git_ignore(true) // Respect .gitignore
             .git_global(true)
-            .filter_entry(|entry| {
+            .filter_entry(move |entry| {
                 let path = entry.path();
 
                 // Skip node_modules, dist, build directories
                 if path.is_dir() {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    return !matches!(
+                    if matches!(
                         name,
                         "node_modules" | "dist" | "build" | ".git" | "coverage" | ".next"
-                    );
+                    ) {
+                        return false;
+                    }
+                    return path == boundary_root
+                        || !path.join("package.json").is_file()
+                        || allowed_project_roots.iter().any(|root| root == path);
                 }
 
                 true
@@ -138,8 +157,9 @@ fn is_node_builtin(specifier: &str) -> bool {
     // Handle node: prefix
     let module = specifier.strip_prefix("node:").unwrap_or(specifier);
 
+    let root = module.split('/').next().unwrap_or(module);
     matches!(
-        module,
+        root,
         "assert"
             | "buffer"
             | "child_process"
@@ -169,6 +189,7 @@ fn is_node_builtin(specifier: &str) -> bool {
             | "stream"
             | "string_decoder"
             | "sys"
+            | "test"
             | "timers"
             | "tls"
             | "trace_events"
@@ -206,5 +227,8 @@ mod tests {
         assert_eq!(extract_package_name("../utils"), None);
         assert_eq!(extract_package_name("fs"), None);
         assert_eq!(extract_package_name("node:fs"), None);
+        assert_eq!(extract_package_name("fs/promises"), None);
+        assert_eq!(extract_package_name("assert/strict"), None);
+        assert_eq!(extract_package_name("node:test"), None);
     }
 }

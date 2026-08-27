@@ -1,0 +1,9 @@
+{
+  "name": "npm-workspace-fixture",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "app": "workspace:*",
+    "minimist": "1.2.5"
+  }
+}

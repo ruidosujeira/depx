@@ -176,6 +176,7 @@ fn is_usage(kind: &EvidenceKind) -> bool {
             | EvidenceKind::CommonJsRequire
             | EvidenceKind::DynamicImport
             | EvidenceKind::ReExport
+            | EvidenceKind::RustCrateReference
             | EvidenceKind::PackageScript { .. }
             | EvidenceKind::ConfigurationReference
     )

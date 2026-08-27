@@ -4,23 +4,27 @@
 [![CI](https://github.com/ruidosujeira/depx/actions/workflows/ci.yml/badge.svg)](https://github.com/ruidosujeira/depx/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Understand what's actually in your `node_modules` and `Cargo.lock`.**
+**Turn lockfiles, source evidence and advisories into dependency decisions you can review.**
 
 <p align="center">
   <img src="assets/demo.gif" alt="depx demo: analyze, why, audit, deprecated and duplicates" width="760">
 </p>
 
-A fast dependency analyzer for JavaScript/TypeScript and Rust projects. It cross-references your lockfile against the code you actually import — so it can tell unused packages from expected dev tools, explain *why* a transitive dependency exists, and flag only the vulnerabilities that affect the versions you really have installed. Written in Rust.
+depx is a fast dependency analyzer for JavaScript/TypeScript and Rust. It combines the exact installed graph with evidence from source files, manifests, scripts and configuration, then explains what it knows, what it does not know and what to do next.
+
+Its key distinction is the decision layer: `depx plan` prioritizes security upgrades, removal reviews, deprecated replacements and version consolidation using reachability, confidence, dependency chains and upgrade risk. Results can be governed with policies, baselines, deterministic JSON and SARIF.
 
 ## Why depx?
 
-Your `node_modules` has hundreds of packages. Do you know:
+Dependency tools often answer only one question: what is installed, what is imported, or what is vulnerable. depx connects those facts so you can answer:
 
-- Which ones are actually imported in your code (and which are just dead weight)?
-- Why `is-odd` is even installed?
-- Whether that vulnerability alert affects a version you actually have?
+- Is this direct dependency referenced by a supported source, script or configuration collector?
+- Is a vulnerable component in observed reachable code, and which direct dependency should be changed?
+- Why is a transitive package present?
+- Is an apparent unused dependency a confident result or a coverage limitation?
+- Which changes should the team make first, and how risky is the target version?
 
-`npm ls`, `npm audit` and `depcheck` each answer a fragment of this. depx connects the dots in a single tool, for both npm and Cargo projects.
+No-evidence results are deliberately phrased as review candidates, not as proof that removal is safe.
 
 ## Installation
 
@@ -38,164 +42,217 @@ cargo install --path .
 
 ## Quick start
 
-Run any command from the root of a project (it auto-detects `package-lock.json` or `Cargo.lock`):
+Run commands from a project root. depx auto-detects npm, pnpm, Yarn or Cargo lockfiles.
 
 ```bash
-depx analyze        # what's used vs. unused
-depx why <package>  # why a package is installed
-depx audit          # version-aware vulnerability scan
-depx deprecated     # deprecated packages, flagged if still used
-depx duplicates     # multiple versions of the same crate (Rust)
+depx analyze                 # findings, usage evidence and coverage
+depx why <package>           # presence, dependency chains and evidence
+depx audit --used-only       # known vulnerabilities in observed used code
+depx plan                    # prioritized remediation decisions
+depx deprecated              # deprecated installed packages
+depx duplicates              # duplicate Cargo crate versions
 ```
 
-Want to try it on a real, tiny project first? This repo ships one:
+This repository includes a small npm demo:
 
 ```bash
-cd examples/demo-app
-npm install         # depx reads the lockfile + source, not node_modules
+cargo run -- analyze examples/demo-app
+cargo run -- plan examples/demo-app
+```
+
+## Actionable remediation plans
+
+`depx plan` combines local analysis with OSV advisories and deprecation metadata:
+
+```text
+Dependency Remediation Plan
+
+5 actions prioritized
+
+1. [URGENT] Upgrade minimist 1.2.5 -> 1.2.6
+   Reason: 1 critical vulnerability in reachable code
+   Evidence: confirmed runtime usage; confidence high
+   Advisories: GHSA-xvch-5gv4-984h
+   Change risk: patch
+   Suggested command: npm install minimist@1.2.6
+```
+
+Priority is based on advisory severity and observed reachability. Direct dependencies get package-manager-aware commands; transitive findings identify the remediation root and dependency chain. `--verbose` shows up to five shortest useful chains per component and `--json` emits the versioned plan schema.
+
+```bash
+depx plan
+depx plan --verbose
+depx plan --json > depx-plan.json
+```
+
+Suggested commands are starting points for review; depx does not modify manifests or lockfiles.
+
+## Evidence-backed analysis
+
+`depx analyze` reports structured findings and groups every component by its strongest supported evidence: runtime, development, build, test, configuration-only, transitive, ambiguous or no evidence.
+
+```bash
 depx analyze
+depx analyze --unused
+depx analyze --no-dev
+depx analyze --json > depx-analysis.json
+depx analyze --sarif > depx.sarif
+depx analyze --fail-on warning
 ```
 
-## Commands
+Options:
 
-### `depx analyze` — find unused dependencies
+- `--unused` shows only components without supported usage evidence.
+- `--no-dev` excludes direct development-only dependencies.
+- `--json` emits deterministic structured analysis.
+- `--sarif` emits SARIF 2.1.0 for code-scanning systems.
+- `--fail-on <never|info|warning|error>` exits with code `1` when a finding reaches the threshold.
+- `--verbose` includes complete explanations and evidence.
 
-```text
-$ depx analyze
+Built-in rules use stable identifiers:
 
-Dependency Analysis Report
+| Rule | Meaning | Default severity |
+|------|---------|------------------|
+| `DX001` | Direct dependency without supported usage evidence | warning |
+| `DX002` | Ambiguous component resolution | warning |
+| `DX003` | Configuration-only direct dependency | info |
+| `DX004` | Duplicate component versions or installations | info, elevated for multiple majors |
+| `DX005` | Direct declaration used only transitively | info |
 
-Summary
-  4 packages used
-  1 packages unused (removable)
-  2 dev/build tools (expected, not imported)
+## Explain a dependency
 
-Unused Dependencies (safe to remove):
-  - is-odd@3.0.1
-
-  Tip: npm uninstall <package>
-
-Dev/Build Tools (not imported, expected):
-  ~ @types/node@20.14.2
-  ~ typescript@5.4.5
+```bash
+depx why wrappy
+depx why shared@2.0.0
 ```
 
-depx parses your source with [oxc](https://oxc.rs) and matches imports against the lockfile. It separates **truly unused** packages from **dev/build tools that aren't meant to be imported** (`@types/*`, `typescript`, `eslint`, `vitest`, bundlers, etc.), so it won't tell you to uninstall your toolchain.
+`why` shows declaration or transitive presence evidence, source evidence, confidence, coverage limitations, related findings and up to five shortest useful chains from direct dependencies. Chain traversal is deterministic, cycle-safe and bounded for dense graphs. Qualify the version when multiple installed components share the same package name; when the same name/version has multiple installation locations, the CLI reports the ambiguity instead of guessing.
 
-**Options:**
-- `--unused` — show only components without supported usage evidence
-- `--no-dev` — exclude development dependencies (included by default)
-- `--json` — emit deterministic machine-readable JSON
-- `-v` / `--verbose` — show complete finding explanations and evidence
+## Vulnerability gates
 
-### `depx why <package>` — explain why a package is installed
+depx queries [OSV](https://osv.dev) with exact installed npm or crates.io versions. `--used-only` limits output to components reachable from observed usage evidence.
 
-```text
-$ depx why wrappy
-
-Package: wrappy@1.0.2
-
-Dependency chains:
-  -> inflight -> wrappy
-     inflight -> once -> wrappy
+```bash
+depx audit
+depx audit --used-only
+depx audit --fail-on critical
+depx audit --fail-on never
 ```
 
-Shows every chain from your direct dependencies down to the package you asked about — so you know which dependency to touch to get rid of it.
+The default threshold is `high`. Accepted values are `any`, `low`, `medium`, `high`, `critical` and `never`. Advisories without a usable textual severity or CVSS score are reported as `unknown`, never silently promoted to `medium`. `any` fails on unknown severity; numeric severity thresholds do not.
 
-### `depx audit` — check for *real* vulnerabilities
+OSV requests use three bounded attempts for transient network errors and HTTP `429`, `500`, `502`, `503` and `504`, honoring a capped `Retry-After` value when present. If the final attempt fails, the audit fails closed as an operational error instead of reporting a clean result.
 
-```text
-$ depx audit
+Exit codes:
 
-1 vulnerability found
+- `0`: no reported vulnerability met the configured threshold.
+- `1`: at least one reported vulnerability met the threshold.
+- `2`: command-line, project, lockfile, network or OSV error.
 
-CRITICAL
-  GHSA-xvch-5gv4-984h minimist@1.2.5 - Prototype Pollution in minimist [USED]
-       Fix: 1.2.5 -> 1.2.6
+## Policies and gradual adoption
+
+Place `depx.toml` in the project root, or pass another file with the global `--config` option:
+
+```toml
+[policy]
+fail_on = "warning"
+baseline = "depx-baseline.json"
+
+[[ignore]]
+package = "generated-client"
+rule = "DX001"
+reason = "Loaded through generated registration code"
+expires = "2026-12-31"
 ```
 
-depx queries the [OSV](https://osv.dev) database **with your exact installed versions** (npm → `npm`, Cargo → `crates.io`), so you don't drown in old CVEs that don't apply to you. The `[USED]` tag marks advisories that hit code your project actually imports.
+Unknown configuration fields are rejected. Every exception needs a non-empty reason. Expired exceptions stop suppressing findings and produce a warning. A package may be written as `name` or `name@version`; omit `rule` to match all findings for that package.
 
-By default, `audit` exits with code `1` when it finds a high or critical vulnerability, so it can gate a CI job. Use `--fail-on` to choose a different threshold or `--fail-on never` for report-only behavior.
+To adopt depx without failing on existing debt:
 
-**Options:**
-- `--used-only` — report only vulnerabilities in packages your code actually uses
-- `--fail-on <level>` — fail on `any`, `low`, `medium`, `high` (default), `critical`, or disable the gate with `never`
-
-**Exit codes:**
-- `0` — no reported vulnerability met the configured threshold
-- `1` — at least one reported vulnerability met the configured threshold
-- `2` — command-line, project, lockfile, network, or OSV error
-
-### `depx deprecated` — find deprecated packages
-
-```text
-$ depx deprecated
-
-1 deprecated package found
-
-  - inflight@1.0.6 [USED]
-    This module is not supported, and leaks memory. Do not use it. Check out
-    lru-cache if you want a good and tested way to coalesce async requests by a
-    key value, which is much more comprehensive and powerful.
+```bash
+depx baseline
+git add depx-baseline.json
+depx analyze --fail-on warning
 ```
 
-Each deprecated package is tagged `[USED]` or `[unused]` so you can prioritize the ones that are actually in your code path.
+The baseline stores stable finding identities. Existing findings are suppressed while new or materially changed findings remain visible. Re-run `depx baseline --output <file>` only after reviewing the current state.
 
-### `depx duplicates` — detect duplicate dependencies (Rust/Cargo)
+Policies and baselines currently apply to analysis findings and plans. Vulnerability gating remains controlled by `audit --fail-on`.
 
-```text
-$ depx duplicates
+## CI integration
 
-Duplicate Dependencies Analysis
+A minimal gate can run both local findings and version-aware vulnerabilities:
 
-Summary
-  12 crates with multiple versions
-  1 high severity (3+ versions)
-  11 low severity (same major version)
-  14 extra compile units
-
-HIGH SEVERITY
-  ! windows-sys (4 versions)
-      v0.52.0 ← ring
-      v0.59.0 ← colored
-      v0.60.2 ← socket2, terminal_size
-      v0.61.2 ← anstyle-query, anstyle-wincon +7 more
-
-  + 11 low severity duplicates (use --verbose to show)
-
-  Tip: Use `cargo tree -d` for detailed dependency tree
+```bash
+depx analyze --fail-on warning
+depx audit --used-only --fail-on high
 ```
 
-Finds when multiple versions of the same crate end up in your build, ranks them by how disruptive they are (different majors hurt more), estimates the extra compile units, and — in verbose mode — suggests which dependency to bump.
+For a code-scanning system, save SARIF without changing the result stream:
 
-**Options:**
-- `-v` / `--verbose` — show all duplicates (including low severity) with upgrade suggestions
-- `--json` — emit JSON for programmatic use
+```bash
+depx analyze --sarif > depx.sarif
+```
+
+JSON, semantic baseline identities, plan action IDs and SARIF fingerprints are deterministic for the same project state. Finding fingerprints are independent from byte-offset-only source edits; evidence locations and spans remain available for diagnostics.
+
+## Deprecated and duplicate packages
+
+```bash
+depx deprecated
+depx duplicates
+depx duplicates --verbose
+depx duplicates --json
+```
+
+`deprecated` marks whether each package has observed usage. `duplicates` analyzes Cargo crates with multiple resolved versions and reports objective facts: exact installations, immediate dependents, direct roots, distinct majors and extra compile units. Three versions within one major remain low impact; different majors are medium impact. The command is informational and does not hard-code a CI failure from version count. Use policy-controlled `depx analyze --fail-on ...` and rule `DX004` when duplicate findings should gate CI.
+
+## Supported project formats
+
+| Project data | Support |
+|--------------|---------|
+| npm `package-lock.json` v1/v2/v3 | graph, manifests, workspaces and analysis |
+| pnpm `pnpm-lock.yaml` v6-v9 layouts | graph, importers, workspaces and analysis |
+| Yarn classic and modern `yarn.lock` | graph, workspaces and analysis |
+| Rust `Cargo.lock` + `Cargo.toml` | graph, workspaces, renamed crates, analysis and duplicates |
+
+JavaScript/TypeScript evidence includes static imports, CommonJS `require`, dynamic imports, re-exports, supported configuration files and scripts from every declared project unit. Node built-ins and their subpaths (for example `fs/promises`, `assert/strict` and `node:test`) are excluded. Rust evidence includes `use`, `extern crate`, crate-qualified paths and macro references, classified across runtime, build, test and development sources.
+
+Workspace manifests become explicit project units. Each source observation is owned by its most specific declared unit and resolves only through that unit's exact declarations and package-manager context. Valid workspace members are scanned; unrelated nested projects are excluded. Yarn Berry locators, including virtual peer contexts, and pnpm peer-qualified locations remain distinct component identities.
+
+Static analysis cannot prove absence. depx reports coverage limitations for computed module names, framework plugin discovery, arbitrary shell behavior, generated sources, conditional Rust compilation and macro expansion.
 
 ## How it works
 
 | Stage | What happens |
 |-------|--------------|
-| **Lockfile** | Parses `package-lock.json` (v1/v2/v3) or `Cargo.lock` into a package graph, tracking direct/dev/transitive status |
-| **Source** | Walks your source and extracts imports with [oxc](https://oxc.rs) — ES modules, CommonJS `require`, dynamic `import()`, and re-exports |
-| **Graph** | Builds a dependency graph with [petgraph](https://github.com/petgraph/petgraph) to resolve `why` chains and transitive usage |
-| **Advisories** | Batches version-pinned queries to [OSV](https://osv.dev) for vulnerabilities, and reads deprecation metadata from the lockfile |
+| Inventory | Parses the detected lockfile into normalized, versioned component identities and dependency edges. |
+| Manifests | Produces explicit project units and resolves each declaration to an exact component in its package-manager context. |
+| Evidence | Collects unit-owned source, script and configuration references with origin, role, confidence and exact or explicit ambiguous resolution. |
+| Findings | Applies validated rules with stable IDs and explicit recommendations. |
+| Advisories | Sends exact installed versions to OSV and marks observed reachability. |
+| Decisions | Produces prioritized remediation actions, upgrade risk, commands and dependency roots. |
+| Governance | Applies justified exceptions, baselines, failure thresholds and machine-readable output. |
 
-## Supported lockfiles
+The dependency direction is intentionally one-way: ecosystem adapters → normalized model/project units → evidence → usage assessment → findings → graph/advisories → remediation plan → policy and output. Finding rules do not contain package-manager resolution logic.
 
-- [x] `package-lock.json` (npm) — full analysis
-- [x] `Cargo.lock` (Rust) — duplicates + version-aware audit
-- [ ] `pnpm-lock.yaml` (planned)
-- [ ] `yarn.lock` (planned)
+## Machine-readable schemas
+
+Public machine-readable formats are explicitly versioned. The current analysis/finding schema, baseline schema, remediation-plan schema and duplicate-analysis schema are version `2`; SARIF uses the `depx/v2` fingerprint key. Version 2 introduces project units and evidence ownership, exact vulnerability component identity, semantic finding fingerprints and objective duplicate facts. Version 1 baselines must be regenerated with `depx baseline` because their occurrence-sensitive IDs are intentionally incompatible. See [docs/schemas.md](docs/schemas.md) for compatibility details.
+
+## Development
+
+```bash
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, [SECURITY.md](SECURITY.md) for private vulnerability reporting and [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Built with AI
 
-This project was built in partnership with Claude (Anthropic). I define the architecture, make decisions, review code, and handle the direction. Claude helps write code faster.
-
-I believe AI is a tool, not a replacement. The developer still needs to understand the problem, evaluate solutions, and take responsibility for the result. AI just accelerates execution.
-
-You can see Claude as a contributor in this repo — that's intentional transparency.
+This project is built in partnership with AI coding tools. Architecture, product direction, review and responsibility remain with the maintainer; AI accelerates implementation. The disclosure is intentional.
 
 ## License
 

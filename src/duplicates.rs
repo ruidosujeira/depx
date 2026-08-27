@@ -1,3 +1,4 @@
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 
 use miette::{bail, Result};
@@ -7,6 +8,7 @@ use crate::ecosystem;
 use crate::finding::rules::duplicate_findings;
 use crate::finding::FindingDetails;
 use crate::model::Ecosystem;
+use crate::model::{ComponentId, ProjectSnapshot};
 use crate::types::{
     DuplicateAnalysis, DuplicateGroup, DuplicateSeverity, DuplicateStats, DuplicateVersion,
 };
@@ -15,6 +17,8 @@ use crate::types::{
 pub struct DuplicateAnalyzer<'a> {
     root: &'a Path,
 }
+
+pub const DUPLICATE_SCHEMA_VERSION: u32 = 2;
 
 impl<'a> DuplicateAnalyzer<'a> {
     pub fn new(root: &'a Path) -> Self {
@@ -47,28 +51,41 @@ impl<'a> DuplicateAnalyzer<'a> {
             let mut version_infos: Vec<_> = components
                 .iter()
                 .map(|component| {
-                    let mut dependents: Vec<_> = snapshot
+                    let mut dependent_components: Vec<_> = snapshot
                         .dependency_edges
                         .iter()
                         .filter(|edge| edge.to == *component)
-                        .map(|edge| edge.from.name.clone())
+                        .map(|edge| edge.from.clone())
+                        .collect();
+                    dependent_components.sort();
+                    dependent_components.dedup();
+                    let mut dependents: Vec<_> = dependent_components
+                        .iter()
+                        .map(|id| id.name.clone())
                         .collect();
                     dependents.sort();
                     dependents.dedup();
                     DuplicateVersion {
+                        component: component.clone(),
                         version: component.version.clone(),
                         dependents,
-                        transitive_count: 0,
+                        dependent_components,
+                        direct_roots: direct_roots(&snapshot, component),
                     }
                 })
                 .collect();
             version_infos.sort_by(|left, right| {
                 compare_versions(&left.version, &right.version)
                     .then_with(|| left.dependents.cmp(&right.dependents))
+                    .then_with(|| left.component.cmp(&right.component))
             });
             let severity = calculate_severity(&version_infos);
+            let major_version_count = distinct_major_versions(&version_infos);
             duplicates.push(DuplicateGroup {
                 name: finding.subject.name,
+                installation_count: version_infos.len(),
+                major_version_count,
+                extra_compile_units: version_infos.len().saturating_sub(1),
                 versions: version_infos,
                 severity,
             });
@@ -84,10 +101,6 @@ impl<'a> DuplicateAnalyzer<'a> {
         // Calculate stats
         let stats = DuplicateStats {
             total_duplicates: duplicates.len(),
-            high_severity: duplicates
-                .iter()
-                .filter(|d| d.severity == DuplicateSeverity::High)
-                .count(),
             medium_severity: duplicates
                 .iter()
                 .filter(|d| d.severity == DuplicateSeverity::Medium)
@@ -99,7 +112,11 @@ impl<'a> DuplicateAnalyzer<'a> {
             extra_compile_units: duplicates.iter().map(|d| d.versions.len() - 1).sum(),
         };
 
-        Ok(DuplicateAnalysis { duplicates, stats })
+        Ok(DuplicateAnalysis {
+            schema_version: DUPLICATE_SCHEMA_VERSION,
+            duplicates,
+            stats,
+        })
     }
 }
 
@@ -113,31 +130,51 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 
 /// Calculate severity based on version differences
 fn calculate_severity(versions: &[DuplicateVersion]) -> DuplicateSeverity {
-    if versions.len() >= 3 {
-        // 3+ versions is always high severity
-        return DuplicateSeverity::High;
+    if distinct_major_versions(versions) > 1 {
+        DuplicateSeverity::Medium
+    } else {
+        DuplicateSeverity::Low
     }
+}
 
-    // Parse major versions
-    let major_versions: Vec<u64> = versions
+fn distinct_major_versions(versions: &[DuplicateVersion]) -> usize {
+    versions
         .iter()
         .filter_map(|v| Version::parse(&v.version).ok())
         .map(|v| v.major)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn direct_roots(snapshot: &ProjectSnapshot, target: &ComponentId) -> Vec<ComponentId> {
+    let direct: HashSet<_> = snapshot
+        .components
+        .iter()
+        .filter(|component| component.direct)
+        .map(|component| component.id.clone())
         .collect();
-
-    if major_versions.is_empty() {
-        return DuplicateSeverity::Low;
+    let mut roots = HashSet::new();
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::from([target.clone()]);
+    while let Some(current) = queue.pop_front() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        if direct.contains(&current) {
+            roots.insert(current);
+            continue;
+        }
+        for edge in snapshot
+            .dependency_edges
+            .iter()
+            .filter(|edge| edge.to == current)
+        {
+            queue.push_back(edge.from.clone());
+        }
     }
-
-    // Check if all major versions are the same
-    let first_major = major_versions[0];
-    let all_same_major = major_versions.iter().all(|&m| m == first_major);
-
-    if all_same_major {
-        DuplicateSeverity::Low
-    } else {
-        DuplicateSeverity::Medium
-    }
+    let mut roots: Vec<_> = roots.into_iter().collect();
+    roots.sort();
+    roots
 }
 
 /// Suggest which version to upgrade to
@@ -173,63 +210,40 @@ pub fn suggest_resolution(group: &DuplicateGroup) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn version(value: &str) -> DuplicateVersion {
+        DuplicateVersion {
+            component: ComponentId {
+                ecosystem: Ecosystem::Cargo,
+                name: "sample".to_string(),
+                version: value.to_string(),
+                location: Some(format!("registry:{value}")),
+            },
+            version: value.to_string(),
+            dependents: vec![],
+            dependent_components: vec![],
+            direct_roots: vec![],
+        }
+    }
+
     #[test]
     fn test_severity_same_major() {
-        let versions = vec![
-            DuplicateVersion {
-                version: "1.0.0".to_string(),
-                dependents: vec![],
-                transitive_count: 0,
-            },
-            DuplicateVersion {
-                version: "1.2.0".to_string(),
-                dependents: vec![],
-                transitive_count: 0,
-            },
-        ];
+        let versions = vec![version("1.0.0"), version("1.2.0")];
 
         assert_eq!(calculate_severity(&versions), DuplicateSeverity::Low);
     }
 
     #[test]
     fn test_severity_different_major() {
-        let versions = vec![
-            DuplicateVersion {
-                version: "1.0.0".to_string(),
-                dependents: vec![],
-                transitive_count: 0,
-            },
-            DuplicateVersion {
-                version: "2.0.0".to_string(),
-                dependents: vec![],
-                transitive_count: 0,
-            },
-        ];
+        let versions = vec![version("1.0.0"), version("2.0.0")];
 
         assert_eq!(calculate_severity(&versions), DuplicateSeverity::Medium);
     }
 
     #[test]
     fn test_severity_many_versions() {
-        let versions = vec![
-            DuplicateVersion {
-                version: "1.0.0".to_string(),
-                dependents: vec![],
-                transitive_count: 0,
-            },
-            DuplicateVersion {
-                version: "1.1.0".to_string(),
-                dependents: vec![],
-                transitive_count: 0,
-            },
-            DuplicateVersion {
-                version: "1.2.0".to_string(),
-                dependents: vec![],
-                transitive_count: 0,
-            },
-        ];
+        let versions = vec![version("1.0.0"), version("1.1.0"), version("1.2.0")];
 
-        assert_eq!(calculate_severity(&versions), DuplicateSeverity::High);
+        assert_eq!(calculate_severity(&versions), DuplicateSeverity::Low);
     }
 
     #[test]

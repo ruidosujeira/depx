@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 use miette::Result;
@@ -11,6 +11,8 @@ use crate::finding::{Finding, ProjectAnalysis};
 use crate::model::{Component, ComponentId, DependencyKind, ProjectSnapshot};
 use crate::query::ComponentQuery;
 use crate::types::PackageExplanation;
+
+pub const MAX_WHY_CHAINS: usize = 5;
 
 /// Dependency graph keyed exclusively by normalized component identity.
 pub struct DependencyGraph {
@@ -92,14 +94,20 @@ impl DependencyGraph {
     /// Explain both presence and evidence-derived participation.
     pub fn explain_package(&self, query: &str) -> Result<PackageExplanation, ExplainError> {
         let id = self.resolve_query(query)?;
+        self.explain_component(&id)
+    }
+
+    /// Explain an already-resolved component without going through the lossy
+    /// name/version CLI query layer.
+    pub fn explain_component(&self, id: &ComponentId) -> Result<PackageExplanation, ExplainError> {
         let component = self
             .components
-            .get(&id)
-            .ok_or_else(|| ExplainError::NotFound(query.to_string()))?;
+            .get(id)
+            .ok_or_else(|| ExplainError::NotFound(id.to_string()))?;
         let component_index = self
             .node_indices
-            .get(&id)
-            .ok_or_else(|| ExplainError::NotFound(query.to_string()))?;
+            .get(id)
+            .ok_or_else(|| ExplainError::NotFound(id.to_string()))?;
         let chains = self.find_dependency_chains(*component_index);
         Ok(PackageExplanation {
             package: component.clone(),
@@ -107,18 +115,18 @@ impl DependencyGraph {
             evidence: self
                 .evidence
                 .iter()
-                .filter(|evidence| evidence.subject == id)
+                .filter(|evidence| evidence.subject == *id)
                 .cloned()
                 .collect(),
             assessment: self
                 .assessments
-                .get(&id)
+                .get(id)
                 .cloned()
-                .ok_or_else(|| ExplainError::NotFound(query.to_string()))?,
+                .ok_or_else(|| ExplainError::NotFound(id.to_string()))?,
             findings: self
                 .findings
                 .iter()
-                .filter(|finding| finding.subject == id)
+                .filter(|finding| finding.subject == *id)
                 .cloned()
                 .collect(),
         })
@@ -135,11 +143,20 @@ impl DependencyGraph {
             return vec![vec![target_id.clone()]];
         }
 
+        // Reverse breadth-first traversal yields shortest chains first. Each
+        // node admits at most MAX_WHY_CHAINS partial paths, bounding work and
+        // memory to O(K * (V + E)) even for dense dependency DAGs.
         let mut queue: VecDeque<(NodeIndex, Vec<ComponentId>)> = VecDeque::new();
         queue.push_back((target, vec![target_id.clone()]));
-        let mut visited_paths: HashSet<Vec<ComponentId>> = HashSet::new();
+        let mut admitted: HashMap<NodeIndex, usize> = HashMap::new();
+        admitted.insert(target, 1);
         while let Some((current, path)) = queue.pop_front() {
-            for neighbor in self.graph.neighbors_directed(current, Direction::Incoming) {
+            let mut neighbors: Vec<_> = self
+                .graph
+                .neighbors_directed(current, Direction::Incoming)
+                .collect();
+            neighbors.sort_by(|left, right| self.graph[*left].cmp(&self.graph[*right]));
+            for neighbor in neighbors {
                 let neighbor_id = &self.graph[neighbor];
                 if path.contains(neighbor_id) {
                     continue;
@@ -151,16 +168,23 @@ impl DependencyGraph {
                     .get(neighbor_id)
                     .is_some_and(|component| component.direct)
                 {
-                    if visited_paths.insert(new_path.clone()) {
-                        chains.push(new_path);
+                    chains.push(new_path);
+                    if chains.len() == MAX_WHY_CHAINS {
+                        chains.sort_by(|left, right| {
+                            left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+                        });
+                        return chains;
                     }
                 } else {
-                    queue.push_back((neighbor, new_path));
+                    let count = admitted.entry(neighbor).or_default();
+                    if *count < MAX_WHY_CHAINS {
+                        *count += 1;
+                        queue.push_back((neighbor, new_path));
+                    }
                 }
             }
         }
-        chains.sort_by_key(Vec::len);
-        chains.truncate(5);
+        chains.sort_by(|left, right| left.len().cmp(&right.len()).then_with(|| left.cmp(right)));
         chains
     }
 }
@@ -248,5 +272,56 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["express", "body-parser", "raw-body"]
         );
+    }
+
+    #[test]
+    fn why_is_bounded_deterministic_and_cycle_safe() {
+        let roots: Vec<_> = (0..4)
+            .map(|index| component(&format!("root-{index}"), "1.0.0", true))
+            .collect();
+        let middle: Vec<_> = (0..4)
+            .map(|index| component(&format!("middle-{index}"), "1.0.0", false))
+            .collect();
+        let target = component("target", "1.0.0", false);
+        let mut edges = Vec::new();
+        for root in &roots {
+            for item in &middle {
+                edges.push(DependencyEdge {
+                    from: root.id.clone(),
+                    to: item.id.clone(),
+                    kind: DependencyKind::Runtime,
+                });
+            }
+        }
+        for item in &middle {
+            edges.push(DependencyEdge {
+                from: item.id.clone(),
+                to: target.id.clone(),
+                kind: DependencyKind::Runtime,
+            });
+        }
+        // Adversarial cycle must not create an infinite path.
+        edges.push(DependencyEdge {
+            from: target.id.clone(),
+            to: middle[0].id.clone(),
+            kind: DependencyKind::Runtime,
+        });
+        let mut components = roots;
+        components.extend(middle);
+        components.push(target.clone());
+        let snapshot = ProjectSnapshot::new(PathBuf::from("."), components, edges);
+        let first = DependencyGraph::new(&snapshot)
+            .unwrap()
+            .explain_component(&target.id)
+            .unwrap()
+            .dependency_chains;
+        let second = DependencyGraph::new(&snapshot)
+            .unwrap()
+            .explain_component(&target.id)
+            .unwrap()
+            .dependency_chains;
+        assert_eq!(first, second);
+        assert_eq!(first.len(), MAX_WHY_CHAINS);
+        assert!(first.iter().all(|chain| chain.len() == 3));
     }
 }

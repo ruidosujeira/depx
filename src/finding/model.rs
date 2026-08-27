@@ -6,7 +6,7 @@ use crate::evidence::{Confidence, EvidenceId};
 use crate::model::ComponentId;
 
 /// Finding schema used when deriving stable IDs.
-pub const FINDING_SCHEMA_VERSION: u32 = 1;
+pub const FINDING_SCHEMA_VERSION: u32 = 2;
 
 /// Stable identity for a derived finding.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -110,12 +110,11 @@ struct FindingIdentity<'a> {
     schema_version: u32,
     rule: &'a RuleCode,
     subject: &'a ComponentId,
-    evidence: &'a [EvidenceId],
     details: &'a FindingDetails,
 }
 
 impl Finding {
-    /// Build an ID stable across identical snapshots for finding schema v1.
+    /// Build a semantic ID independent from occurrence spans/wording for schema v2.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         rule: RuleCode,
@@ -134,7 +133,6 @@ impl Finding {
             schema_version: FINDING_SCHEMA_VERSION,
             rule: &rule,
             subject: &subject,
-            evidence: &evidence,
             details: &details,
         })
         .into_diagnostic()?;

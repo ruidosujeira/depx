@@ -1,0 +1,25 @@
+lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      minimist:
+        specifier: 1.2.5
+        version: 1.2.5
+  packages/app:
+    dependencies:
+      is-odd:
+        specifier: 3.0.1
+        version: 3.0.1
+
+packages:
+  minimist@1.2.5: {}
+  is-odd@3.0.1: {}
+  is-number@6.0.0: {}
+
+snapshots:
+  minimist@1.2.5: {}
+  is-odd@3.0.1:
+    dependencies:
+      is-number: 6.0.0
+  is-number@6.0.0: {}

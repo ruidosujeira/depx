@@ -1,0 +1,7 @@
+{
+  "name": "unrelated-nested-project",
+  "private": true,
+  "dependencies": {
+    "is-odd": "3.0.1"
+  }
+}

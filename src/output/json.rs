@@ -4,13 +4,14 @@ use serde::Serialize;
 use crate::analysis::{AnalysisCoverage, UsageAssessment};
 use crate::evidence::Evidence;
 use crate::finding::{Finding, ProjectAnalysis, FINDING_SCHEMA_VERSION};
-use crate::model::Component;
+use crate::model::{Component, ProjectUnit};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JsonOutput<'a> {
     schema_version: u32,
     project: JsonProject<'a>,
+    units: &'a [ProjectUnit],
     components: &'a [Component],
     evidence: &'a [Evidence],
     assessments: &'a [UsageAssessment],
@@ -29,6 +30,7 @@ pub fn serialize_analysis(analysis: &ProjectAnalysis) -> Result<String> {
         project: JsonProject {
             root: &analysis.snapshot.root,
         },
+        units: &analysis.snapshot.units,
         components: &analysis.snapshot.components,
         evidence: &analysis.snapshot.evidence,
         assessments: &analysis.assessments,
