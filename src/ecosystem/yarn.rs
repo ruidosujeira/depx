@@ -1,15 +1,16 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use miette::{Context, IntoDiagnostic, Result};
 
-use crate::evidence::{manifest_evidence, transitive_evidence, ManifestSection};
 use crate::model::{
     Component, ComponentId, DependencyEdge, DependencyKind, Ecosystem, ProjectSnapshot,
 };
 
-use super::javascript::{read_manifests, ManifestRecord};
+use super::javascript::{
+    project_units, read_manifests, ManifestRecord, ResolvedManifestDeclaration,
+};
 use super::EcosystemAdapter;
 
 /// Adapter for Yarn classic and modern text lockfiles.
@@ -38,6 +39,8 @@ impl EcosystemAdapter for YarnAdapter {
 #[derive(Debug, Clone)]
 struct YarnEntry {
     descriptors: Vec<Descriptor>,
+    /// Yarn Berry locator/resolution, including virtual peer context when present.
+    locator: Option<String>,
     version: String,
     dependencies: BTreeMap<String, (String, DependencyKind)>,
 }
@@ -46,14 +49,6 @@ struct YarnEntry {
 struct Descriptor {
     name: String,
     range: String,
-}
-
-#[derive(Debug)]
-struct ResolvedDeclaration {
-    id: ComponentId,
-    path: PathBuf,
-    section: ManifestSection,
-    dev: bool,
 }
 
 fn build_snapshot(
@@ -68,11 +63,20 @@ fn build_snapshot(
         let Some(primary) = entry.descriptors.first() else {
             continue;
         };
+        let locator = entry.locator.clone().unwrap_or_else(|| {
+            let mut descriptors: Vec<_> = entry
+                .descriptors
+                .iter()
+                .map(|descriptor| descriptor_key(&descriptor.name, &descriptor.range))
+                .collect();
+            descriptors.sort();
+            descriptors.join(",")
+        });
         let id = ComponentId {
             ecosystem: Ecosystem::Npm,
             name: primary.name.clone(),
             version: entry.version.clone(),
-            location: Some(format!("yarn:{}@{}", primary.name, entry.version)),
+            location: Some(format!("yarn:{locator}")),
         };
         for descriptor in &entry.descriptors {
             ids_by_descriptor.insert(
@@ -119,23 +123,15 @@ fn build_snapshot(
             }
         }
     }
-    let mut evidence = Vec::new();
-    for declaration in declarations {
-        evidence.push(manifest_evidence(
-            declaration.id,
-            declaration.path,
-            declaration.section,
-        )?);
-    }
-    evidence.extend(transitive_evidence(&edges, "yarn.lock".into())?);
-    ProjectSnapshot::new(root.to_path_buf(), components, edges).with_evidence(evidence)
+    let units = project_units(&manifests, &declarations);
+    ProjectSnapshot::new(root.to_path_buf(), components, edges).with_units(units)
 }
 
 fn resolve_declarations(
     manifests: &[ManifestRecord],
     ids_by_descriptor: &HashMap<String, ComponentId>,
     ids_by_name: &BTreeMap<String, Vec<ComponentId>>,
-) -> Vec<ResolvedDeclaration> {
+) -> Vec<ResolvedManifestDeclaration> {
     let mut declarations = Vec::new();
     for record in manifests {
         for declaration in record.manifest.declarations() {
@@ -145,9 +141,10 @@ fn resolve_declarations(
                 ids_by_descriptor,
                 ids_by_name,
             ) {
-                declarations.push(ResolvedDeclaration {
+                declarations.push(ResolvedManifestDeclaration {
+                    name: declaration.name,
                     id,
-                    path: record.path.clone(),
+                    unit_root: record.directory.clone(),
                     section: declaration.section,
                     dev: declaration.dev,
                 });
@@ -157,11 +154,14 @@ fn resolve_declarations(
     declarations.sort_by(|left, right| {
         left.id
             .cmp(&right.id)
-            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.unit_root.cmp(&right.unit_root))
             .then_with(|| left.section.cmp(&right.section))
     });
     declarations.dedup_by(|left, right| {
-        left.id == right.id && left.path == right.path && left.section == right.section
+        left.id == right.id
+            && left.name == right.name
+            && left.unit_root == right.unit_root
+            && left.section == right.section
     });
     declarations
 }
@@ -216,6 +216,7 @@ fn parse_yarn_lock(content: &str) -> Result<Vec<YarnEntry>> {
             .collect();
         index += 1;
         let mut version = None;
+        let mut locator = None;
         let mut dependencies = BTreeMap::new();
         while index < lines.len() {
             let body = lines[index];
@@ -225,6 +226,11 @@ fn parse_yarn_lock(content: &str) -> Result<Vec<YarnEntry>> {
             let trimmed = body.trim();
             if let Some(value) = field_value(trimmed, "version") {
                 version = Some(value.to_string());
+                index += 1;
+                continue;
+            }
+            if let Some(value) = field_value(trimmed, "resolution") {
+                locator = Some(value.to_string());
                 index += 1;
                 continue;
             }
@@ -251,6 +257,7 @@ fn parse_yarn_lock(content: &str) -> Result<Vec<YarnEntry>> {
         if let Some(version) = version {
             entries.push(YarnEntry {
                 descriptors,
+                locator,
                 version,
                 dependencies,
             });
@@ -313,6 +320,7 @@ mod tests {
 
 child@npm:^2.0.0:
   version: 2.1.0
+  resolution: "child@npm:2.1.0"
 "#,
         )
         .unwrap();
@@ -321,5 +329,43 @@ child@npm:^2.0.0:
         assert_eq!(entries[0].version, "1.2.0");
         assert!(entries[0].dependencies.contains_key("child"));
         assert_eq!(entries[1].version, "2.1.0");
+        assert_eq!(entries[1].locator.as_deref(), Some("child@npm:2.1.0"));
+    }
+
+    #[test]
+    fn modern_virtual_peer_contexts_have_distinct_component_ids() {
+        let entries = parse_yarn_lock(
+            r#"__metadata:
+  version: 8
+
+"peerful@virtual:aaa#npm:^1.0.0":
+  version: 1.0.0
+  resolution: "peerful@virtual:aaa#npm:1.0.0"
+
+"peerful@virtual:bbb#npm:^1.0.0":
+  version: 1.0.0
+  resolution: "peerful@virtual:bbb#npm:1.0.0"
+"#,
+        )
+        .unwrap();
+        let manifests = Vec::new();
+        let snapshot = build_snapshot(Path::new("."), entries, manifests).unwrap();
+        let peerful: Vec<_> = snapshot
+            .components
+            .iter()
+            .filter(|component| component.id.name == "peerful")
+            .collect();
+        assert_eq!(peerful.len(), 2);
+        assert_ne!(peerful[0].id, peerful[1].id);
+        assert!(peerful.iter().any(|component| component
+            .id
+            .location
+            .as_deref()
+            .is_some_and(|location| location.contains("virtual:aaa"))));
+        assert!(peerful.iter().any(|component| component
+            .id
+            .location
+            .as_deref()
+            .is_some_and(|location| location.contains("virtual:bbb"))));
     }
 }

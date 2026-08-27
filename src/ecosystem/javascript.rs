@@ -8,6 +8,7 @@ use miette::{Context, IntoDiagnostic, Result};
 use serde::Deserialize;
 
 use crate::evidence::ManifestSection;
+use crate::model::{ComponentId, Ecosystem, ProjectUnit, UnitDeclaration};
 
 #[derive(Debug)]
 pub(super) struct ManifestRecord {
@@ -21,6 +22,40 @@ pub(super) struct DependencyDeclaration {
     pub name: String,
     pub section: ManifestSection,
     pub dev: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ResolvedManifestDeclaration {
+    pub name: String,
+    pub id: ComponentId,
+    pub unit_root: PathBuf,
+    pub section: ManifestSection,
+    pub dev: bool,
+}
+
+pub(super) fn project_units(
+    manifests: &[ManifestRecord],
+    declarations: &[ResolvedManifestDeclaration],
+) -> Vec<ProjectUnit> {
+    manifests
+        .iter()
+        .map(|record| {
+            ProjectUnit::new(
+                record.directory.clone(),
+                record.path.clone(),
+                Ecosystem::Npm,
+                declarations
+                    .iter()
+                    .filter(|declaration| declaration.unit_root == record.directory)
+                    .map(|declaration| UnitDeclaration {
+                        name: declaration.name.clone(),
+                        component: declaration.id.clone(),
+                        section: declaration.section,
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize, Default)]

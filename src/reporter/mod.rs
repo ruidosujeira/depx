@@ -270,12 +270,17 @@ impl Reporter {
             .iter()
             .filter(|v| v.severity == Severity::Low)
             .collect();
+        let unknown: Vec<_> = vulnerabilities
+            .iter()
+            .filter(|v| v.severity == Severity::Unknown)
+            .collect();
 
         let severity_groups: Vec<(&str, Vec<_>, fn(&str) -> String)> = vec![
             ("CRITICAL", critical, |s: &str| s.red().bold().to_string()),
             ("HIGH", high, |s: &str| s.red().to_string()),
             ("MEDIUM", medium, |s: &str| s.yellow().to_string()),
             ("LOW", low, |s: &str| s.dimmed().to_string()),
+            ("UNKNOWN", unknown, |s: &str| s.dimmed().to_string()),
         ];
 
         for (severity_name, vulns, color_fn) in severity_groups {
@@ -296,10 +301,9 @@ impl Reporter {
                 };
 
                 println!(
-                    "  {} {}@{} - {}{}",
+                    "  {} {} - {}{}",
                     vuln.id.white(),
-                    vuln.package_name.cyan(),
-                    vuln.installed_version.yellow(),
+                    vuln.component.to_string().cyan(),
                     vuln.title.dimmed(),
                     used_marker
                 );
@@ -308,7 +312,7 @@ impl Reporter {
                     println!(
                         "       {} {} -> {}",
                         "Fix:".dimmed(),
-                        vuln.installed_version.red(),
+                        vuln.component.version.red(),
                         patched.green()
                     );
                 }
@@ -446,25 +450,18 @@ impl Reporter {
             stats.total_duplicates.to_string().yellow(),
             plural_s(stats.total_duplicates)
         );
-        if stats.high_severity > 0 {
-            println!(
-                "  {} {}",
-                stats.high_severity.to_string().red().bold(),
-                "high severity (3+ versions)".red()
-            );
-        }
         if stats.medium_severity > 0 {
             println!(
                 "  {} {}",
                 stats.medium_severity.to_string().yellow(),
-                "medium severity (different major versions)".yellow()
+                "medium impact (different major versions)".yellow()
             );
         }
         if stats.low_severity > 0 {
             println!(
                 "  {} {}",
                 stats.low_severity.to_string().dimmed(),
-                "low severity (same major version)".dimmed()
+                "low impact (same major version)".dimmed()
             );
         }
         println!(
@@ -475,11 +472,6 @@ impl Reporter {
         println!();
 
         // Group by severity
-        let high: Vec<_> = analysis
-            .duplicates
-            .iter()
-            .filter(|d| d.severity == DuplicateSeverity::High)
-            .collect();
         let medium: Vec<_> = analysis
             .duplicates
             .iter()
@@ -490,15 +482,6 @@ impl Reporter {
             .iter()
             .filter(|d| d.severity == DuplicateSeverity::Low)
             .collect();
-
-        // High severity
-        if !high.is_empty() {
-            println!("{}", "HIGH SEVERITY".red().bold());
-            for group in high {
-                self.print_duplicate_group(group);
-            }
-            println!();
-        }
 
         // Medium severity
         if !medium.is_empty() {
@@ -537,7 +520,6 @@ impl Reporter {
 
     fn print_duplicate_group(&self, group: &crate::types::DuplicateGroup) {
         let severity_marker = match group.severity {
-            DuplicateSeverity::High => "!".red().bold(),
             DuplicateSeverity::Medium => "~".yellow(),
             DuplicateSeverity::Low => "-".dimmed(),
         };
@@ -550,6 +532,12 @@ impl Reporter {
         );
 
         for version in &group.versions {
+            let repeated_version = group
+                .versions
+                .iter()
+                .filter(|candidate| candidate.version == version.version)
+                .count()
+                > 1;
             let dependents_str = if version.dependents.is_empty() {
                 "(root)".to_string()
             } else if version.dependents.len() <= 3 || self.verbose {
@@ -562,11 +550,25 @@ impl Reporter {
                 )
             };
 
-            println!(
-                "      {} {}",
-                format!("v{}", version.version).white(),
-                dependents_str.dimmed()
-            );
+            let identity = if self.verbose || repeated_version {
+                version.component.to_string()
+            } else {
+                format!("v{}", version.version)
+            };
+            println!("      {} {}", identity.white(), dependents_str.dimmed());
+            if self.verbose && !version.direct_roots.is_empty() {
+                println!(
+                    "        {} {}",
+                    "direct roots:".dimmed(),
+                    version
+                        .direct_roots
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                        .dimmed()
+                );
+            }
         }
 
         // Show suggestion if available

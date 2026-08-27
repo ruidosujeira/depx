@@ -1,0 +1,5 @@
+{
+  "name": "b",
+  "private": true,
+  "dependencies": { "shared": "1.0.0" }
+}

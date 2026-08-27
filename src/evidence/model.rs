@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use miette::{bail, IntoDiagnostic, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ComponentId, DependencyKind};
+use crate::model::{ComponentId, DependencyKind, ProjectUnitId};
 
 /// Stable, content-derived identity for one evidence item.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -99,6 +99,8 @@ pub enum EvidenceResolution {
 pub struct Evidence {
     pub id: EvidenceId,
     pub subject: ComponentId,
+    /// Manifest-owned unit that produced this observation, when applicable.
+    pub owner: Option<ProjectUnitId>,
     pub kind: EvidenceKind,
     pub origin: EvidenceOrigin,
     pub role: SourceRole,
@@ -109,6 +111,7 @@ pub struct Evidence {
 #[derive(Serialize)]
 struct EvidencePayload<'a> {
     subject: &'a ComponentId,
+    owner: &'a Option<ProjectUnitId>,
     kind: &'a EvidenceKind,
     origin: &'a EvidenceOrigin,
     role: SourceRole,
@@ -119,6 +122,41 @@ struct EvidencePayload<'a> {
 impl Evidence {
     /// Construct evidence with an ID derived deterministically from its payload.
     pub fn new(
+        subject: ComponentId,
+        kind: EvidenceKind,
+        origin: EvidenceOrigin,
+        role: SourceRole,
+        confidence: Confidence,
+        resolution: EvidenceResolution,
+    ) -> Result<Self> {
+        Self::new_owned(None, subject, kind, origin, role, confidence, resolution)
+    }
+
+    /// Construct evidence attributed to an exact project/workspace unit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_unit(
+        owner: ProjectUnitId,
+        subject: ComponentId,
+        kind: EvidenceKind,
+        origin: EvidenceOrigin,
+        role: SourceRole,
+        confidence: Confidence,
+        resolution: EvidenceResolution,
+    ) -> Result<Self> {
+        Self::new_owned(
+            Some(owner),
+            subject,
+            kind,
+            origin,
+            role,
+            confidence,
+            resolution,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_owned(
+        owner: Option<ProjectUnitId>,
         subject: ComponentId,
         kind: EvidenceKind,
         origin: EvidenceOrigin,
@@ -138,6 +176,7 @@ impl Evidence {
         }
         let bytes = serde_json::to_vec(&EvidencePayload {
             subject: &subject,
+            owner: &owner,
             kind: &kind,
             origin: &origin,
             role,
@@ -149,6 +188,7 @@ impl Evidence {
         Ok(Self {
             id,
             subject,
+            owner,
             kind,
             origin,
             role,

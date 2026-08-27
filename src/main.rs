@@ -74,7 +74,8 @@ impl AuditFailOn {
     fn matches(self, severity: Severity) -> bool {
         match self {
             Self::Never => false,
-            Self::Any | Self::Low => true,
+            Self::Any => true,
+            Self::Low => severity >= Severity::Low,
             Self::Medium => severity >= Severity::Medium,
             Self::High => severity >= Severity::High,
             Self::Critical => severity >= Severity::Critical,
@@ -521,15 +522,6 @@ async fn run_duplicates(path: &Path, verbose: bool, json: bool) -> Result<()> {
         reporter.report_duplicates(&analysis);
     }
 
-    // Exit non-zero on high-severity duplicates (3+ versions of a crate) so the
-    // command can gate a CI step. Lower severities are informational and keep a
-    // zero exit. Flush first since `exit` skips stdout's buffer teardown.
-    if analysis.stats.high_severity > 0 {
-        use std::io::Write;
-        std::io::stdout().flush().ok();
-        std::process::exit(1);
-    }
-
     Ok(())
 }
 
@@ -550,6 +542,15 @@ fn without_dev_components(snapshot: ProjectSnapshot) -> Result<ProjectSnapshot> 
         .into_iter()
         .filter(|edge| retained.contains(&edge.from) && retained.contains(&edge.to))
         .collect();
+    let units = snapshot
+        .units
+        .into_iter()
+        .map(|mut unit| {
+            unit.declarations
+                .retain(|declaration| retained.contains(&declaration.component));
+            unit
+        })
+        .collect();
     let evidence = snapshot
         .evidence
         .into_iter()
@@ -565,7 +566,9 @@ fn without_dev_components(snapshot: ProjectSnapshot) -> Result<ProjectSnapshot> 
                 .all(|candidate| retained.contains(candidate)),
         })
         .collect();
-    ProjectSnapshot::new(snapshot.root, components, dependency_edges).with_evidence(evidence)
+    ProjectSnapshot::new(snapshot.root, components, dependency_edges)
+        .with_units(units)?
+        .with_evidence(evidence)
 }
 
 #[cfg(test)]
@@ -597,6 +600,8 @@ mod tests {
     fn audit_fail_on_thresholds_match_expected_severities() {
         assert!(!AuditFailOn::Never.matches(Severity::Critical));
         assert!(AuditFailOn::Any.matches(Severity::Low));
+        assert!(AuditFailOn::Any.matches(Severity::Unknown));
+        assert!(!AuditFailOn::Low.matches(Severity::Unknown));
         assert!(AuditFailOn::Low.matches(Severity::Low));
         assert!(!AuditFailOn::Medium.matches(Severity::Low));
         assert!(AuditFailOn::Medium.matches(Severity::Medium));

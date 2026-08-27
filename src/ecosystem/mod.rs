@@ -11,7 +11,6 @@ use miette::{bail, Result};
 use crate::model::{Ecosystem, ProjectSnapshot};
 
 pub use cargo::CargoAdapter;
-pub(crate) use cargo::{cargo_manifest_aliases, cargo_manifest_roots};
 pub use npm::NpmAdapter;
 pub use pnpm::PnpmAdapter;
 pub use yarn::YarnAdapter;
@@ -56,7 +55,6 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::evidence::EvidenceKind;
     use crate::graph::{DependencyGraph, ExplainError};
     use crate::model::DependencyKind;
 
@@ -123,10 +121,14 @@ mod tests {
             .find(|component| component.id.name == "is-odd")
             .unwrap();
         assert!(is_odd.direct);
-        assert!(snapshot.evidence.iter().any(|evidence| {
-            evidence.subject == is_odd.id
-                && evidence.origin.path == Path::new("packages/app/package.json")
+        assert!(snapshot.units.iter().any(|unit| {
+            unit.manifest == Path::new("packages/app/package.json")
+                && unit
+                    .declarations
+                    .iter()
+                    .any(|declaration| declaration.component == is_odd.id)
         }));
+        assert_eq!(snapshot.units.len(), 2);
     }
 
     #[test]
@@ -147,9 +149,10 @@ mod tests {
             .unwrap()
             .starts_with("registry+"));
         assert!(foo_two.direct);
-        assert!(snapshot.evidence.iter().any(|evidence| {
-            evidence.subject == foo_two.id
-                && matches!(evidence.kind, EvidenceKind::ManifestDeclaration { .. })
+        assert!(snapshot.units.iter().any(|unit| {
+            unit.declarations
+                .iter()
+                .any(|declaration| declaration.component == foo_two.id)
         }));
         assert!(snapshot.dependency_edges.iter().any(|edge| {
             edge.from == foo_two.id
@@ -193,13 +196,19 @@ mod tests {
             .components
             .iter()
             .any(|component| { matches!(component.id.name.as_str(), "app" | "tool") }));
-        assert!(snapshot.evidence.iter().any(|evidence| {
-            evidence.subject == anyhow.id
-                && evidence.origin.path == Path::new("crates/app/Cargo.toml")
+        assert!(snapshot.units.iter().any(|unit| {
+            unit.manifest == Path::new("crates/app/Cargo.toml")
+                && unit
+                    .declarations
+                    .iter()
+                    .any(|declaration| declaration.component == anyhow.id)
         }));
-        assert!(snapshot.evidence.iter().any(|evidence| {
-            evidence.subject == yansi.id
-                && evidence.origin.path == Path::new("internal/shared/Cargo.toml")
+        assert!(snapshot.units.iter().any(|unit| {
+            unit.manifest == Path::new("internal/shared/Cargo.toml")
+                && unit
+                    .declarations
+                    .iter()
+                    .any(|declaration| declaration.component == yansi.id)
         }));
     }
 
@@ -219,10 +228,14 @@ mod tests {
             .unwrap();
         assert!(minimist.direct);
         assert!(is_odd.direct);
-        assert!(snapshot.evidence.iter().any(|evidence| {
-            evidence.subject == is_odd.id
-                && evidence.origin.path == Path::new("packages/app/package.json")
+        assert!(snapshot.units.iter().any(|unit| {
+            unit.manifest == Path::new("packages/app/package.json")
+                && unit
+                    .declarations
+                    .iter()
+                    .any(|declaration| declaration.component == is_odd.id)
         }));
+        assert_eq!(snapshot.units.len(), 2);
         assert!(snapshot.dependency_edges.iter().any(|edge| {
             edge.from == is_odd.id && edge.to.name == "is-number" && edge.to.version == "6.0.0"
         }));
@@ -244,10 +257,14 @@ mod tests {
             .unwrap();
         assert!(minimist.direct);
         assert!(is_odd.direct);
-        assert!(snapshot.evidence.iter().any(|evidence| {
-            evidence.subject == is_odd.id
-                && evidence.origin.path == Path::new("packages/app/package.json")
+        assert!(snapshot.units.iter().any(|unit| {
+            unit.manifest == Path::new("packages/app/package.json")
+                && unit
+                    .declarations
+                    .iter()
+                    .any(|declaration| declaration.component == is_odd.id)
         }));
+        assert_eq!(snapshot.units.len(), 2);
         assert!(snapshot.dependency_edges.iter().any(|edge| {
             edge.from == is_odd.id && edge.to.name == "is-number" && edge.to.version == "6.0.0"
         }));

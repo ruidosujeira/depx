@@ -4,12 +4,13 @@ use std::path::Path;
 use miette::{Context, IntoDiagnostic, Result};
 use serde::Deserialize;
 
-use crate::evidence::{manifest_evidence, transitive_evidence, ManifestSection};
 use crate::model::{
     Component, ComponentId, DependencyEdge, DependencyKind, Ecosystem, ProjectSnapshot,
 };
 
-use super::javascript::{read_manifests, ManifestRecord};
+use super::javascript::{
+    project_units, read_manifests, ManifestRecord, ResolvedManifestDeclaration,
+};
 use super::EcosystemAdapter;
 
 /// Adapter for npm `package-lock.json` projects.
@@ -66,6 +67,7 @@ fn build_v2_snapshot(
         ids_by_location.insert(location.clone(), id);
     }
     let declarations = resolve_manifest_declarations(&manifests, &ids_by_location);
+    let units = project_units(&manifests, &declarations);
     let direct_ids: HashSet<_> = declarations.iter().map(|item| item.id.clone()).collect();
     let runtime_ids: HashSet<_> = declarations
         .iter()
@@ -115,7 +117,7 @@ fn build_v2_snapshot(
         }
     }
 
-    build_snapshot_with_evidence(root, components, edges, declarations)
+    finish_snapshot(root, components, edges, units)
 }
 
 fn build_v1_snapshot(
@@ -137,6 +139,7 @@ fn build_v1_snapshot(
         ids_by_location.insert(record.location.clone(), id);
     }
     let declarations = resolve_manifest_declarations(&manifests, &ids_by_location);
+    let units = project_units(&manifests, &declarations);
     let direct_ids: HashSet<_> = declarations.iter().map(|item| item.id.clone()).collect();
     let runtime_ids: HashSet<_> = declarations
         .iter()
@@ -177,28 +180,22 @@ fn build_v1_snapshot(
         }
     }
 
-    build_snapshot_with_evidence(root, components, edges, declarations)
-}
-
-struct ResolvedDeclaration {
-    id: ComponentId,
-    path: std::path::PathBuf,
-    section: ManifestSection,
-    dev: bool,
+    finish_snapshot(root, components, edges, units)
 }
 
 fn resolve_manifest_declarations(
     manifests: &[ManifestRecord],
     ids_by_location: &HashMap<String, ComponentId>,
-) -> Vec<ResolvedDeclaration> {
+) -> Vec<ResolvedManifestDeclaration> {
     let mut declarations = Vec::new();
     for record in manifests {
         let from = record.directory.to_string_lossy().replace('\\', "/");
         for declaration in record.manifest.declarations() {
             if let Some(id) = resolve_npm_dependency(&from, &declaration.name, ids_by_location) {
-                declarations.push(ResolvedDeclaration {
+                declarations.push(ResolvedManifestDeclaration {
+                    name: declaration.name,
                     id: id.clone(),
-                    path: record.path.clone(),
+                    unit_root: record.directory.clone(),
                     section: declaration.section,
                     dev: declaration.dev,
                 });
@@ -208,31 +205,25 @@ fn resolve_manifest_declarations(
     declarations.sort_by(|left, right| {
         left.id
             .cmp(&right.id)
-            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.unit_root.cmp(&right.unit_root))
             .then_with(|| left.section.cmp(&right.section))
     });
     declarations.dedup_by(|left, right| {
-        left.id == right.id && left.path == right.path && left.section == right.section
+        left.id == right.id
+            && left.name == right.name
+            && left.unit_root == right.unit_root
+            && left.section == right.section
     });
     declarations
 }
 
-fn build_snapshot_with_evidence(
+fn finish_snapshot(
     root: &Path,
     components: Vec<Component>,
     edges: Vec<DependencyEdge>,
-    declarations: Vec<ResolvedDeclaration>,
+    units: Vec<crate::model::ProjectUnit>,
 ) -> Result<ProjectSnapshot> {
-    let mut evidence = Vec::new();
-    for declaration in declarations {
-        evidence.push(manifest_evidence(
-            declaration.id,
-            declaration.path,
-            declaration.section,
-        )?);
-    }
-    evidence.extend(transitive_evidence(&edges, "package-lock.json".into())?);
-    ProjectSnapshot::new(root.to_path_buf(), components, edges).with_evidence(evidence)
+    ProjectSnapshot::new(root.to_path_buf(), components, edges).with_units(units)
 }
 
 struct V1Record<'a> {

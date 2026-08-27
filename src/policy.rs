@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::finding::{is_known_code, Finding, FindingSeverity, ProjectAnalysis};
 
-const BASELINE_SCHEMA_VERSION: u32 = 1;
+const BASELINE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -264,7 +264,7 @@ fn read_baseline(path: &Path) -> Result<HashSet<String>> {
         .with_context(|| format!("Failed to parse depx baseline {}", path.display()))?;
     if baseline.schema_version != BASELINE_SCHEMA_VERSION {
         bail!(
-            "Unsupported depx baseline schema version {} in {}",
+            "Unsupported depx baseline schema version {} in {}; regenerate it with `depx baseline`",
             baseline.schema_version,
             path.display()
         );

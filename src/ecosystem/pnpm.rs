@@ -1,17 +1,18 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use miette::{Context, IntoDiagnostic, Result};
 use serde::Deserialize;
 use serde_yaml_ng::{Mapping, Value};
 
-use crate::evidence::{manifest_evidence, transitive_evidence, ManifestSection};
 use crate::model::{
     Component, ComponentId, DependencyEdge, DependencyKind, Ecosystem, ProjectSnapshot,
 };
 
-use super::javascript::{read_manifests, ManifestRecord};
+use super::javascript::{
+    project_units, read_manifests, ManifestRecord, ResolvedManifestDeclaration,
+};
 use super::EcosystemAdapter;
 
 /// Adapter for pnpm lockfiles (v6 through v9 layouts).
@@ -46,14 +47,6 @@ struct PnpmRecord<'a> {
     name: String,
     version: String,
     info: &'a Value,
-}
-
-#[derive(Debug)]
-struct ResolvedDeclaration {
-    id: ComponentId,
-    path: PathBuf,
-    section: ManifestSection,
-    dev: bool,
 }
 
 fn build_snapshot(
@@ -167,16 +160,8 @@ fn build_snapshot(
         }
     }
 
-    let mut evidence = Vec::new();
-    for declaration in declarations {
-        evidence.push(manifest_evidence(
-            declaration.id,
-            declaration.path,
-            declaration.section,
-        )?);
-    }
-    evidence.extend(transitive_evidence(&edges, "pnpm-lock.yaml".into())?);
-    ProjectSnapshot::new(root.to_path_buf(), components, edges).with_evidence(evidence)
+    let units = project_units(&manifests, &declarations);
+    ProjectSnapshot::new(root.to_path_buf(), components, edges).with_units(units)
 }
 
 fn resolve_declarations(
@@ -184,7 +169,7 @@ fn resolve_declarations(
     importers: Option<&Mapping>,
     ids_by_key: &HashMap<String, ComponentId>,
     ids_by_name_version: &BTreeMap<(String, String), Vec<ComponentId>>,
-) -> Vec<ResolvedDeclaration> {
+) -> Vec<ResolvedManifestDeclaration> {
     let mut declarations = Vec::new();
     for record in manifests {
         let importer_key = if record.directory.as_os_str().is_empty() {
@@ -209,9 +194,10 @@ fn resolve_declarations(
                 })
                 .or_else(|| unique_name_match(&declaration.name, ids_by_name_version));
             if let Some(id) = id {
-                declarations.push(ResolvedDeclaration {
+                declarations.push(ResolvedManifestDeclaration {
+                    name: declaration.name,
                     id,
-                    path: record.path.clone(),
+                    unit_root: record.directory.clone(),
                     section: declaration.section,
                     dev: declaration.dev,
                 });
@@ -221,11 +207,14 @@ fn resolve_declarations(
     declarations.sort_by(|left, right| {
         left.id
             .cmp(&right.id)
-            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.unit_root.cmp(&right.unit_root))
             .then_with(|| left.section.cmp(&right.section))
     });
     declarations.dedup_by(|left, right| {
-        left.id == right.id && left.path == right.path && left.section == right.section
+        left.id == right.id
+            && left.name == right.name
+            && left.unit_root == right.unit_root
+            && left.section == right.section
     });
     declarations
 }

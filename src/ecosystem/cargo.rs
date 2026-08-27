@@ -7,9 +7,10 @@ use ignore::WalkBuilder;
 use miette::{Context, IntoDiagnostic, Result};
 use serde::Deserialize;
 
-use crate::evidence::{manifest_evidence, transitive_evidence, ManifestSection};
+use crate::evidence::ManifestSection;
 use crate::model::{
     Component, ComponentId, DependencyEdge, DependencyKind, Ecosystem, ProjectSnapshot,
+    ProjectUnit, UnitDeclaration,
 };
 
 use super::EcosystemAdapter;
@@ -31,6 +32,7 @@ impl EcosystemAdapter for CargoAdapter {
         let manifests = read_manifests(root)?;
         let ids = component_ids(&lockfile);
         let declarations = resolve_manifest_declarations(&lockfile, &ids, &manifests);
+        let units = cargo_project_units(&manifests, &declarations);
         let direct_ids: HashSet<_> = declarations
             .iter()
             .map(|declaration| declaration.id.clone())
@@ -78,16 +80,7 @@ impl EcosystemAdapter for CargoAdapter {
             }
         }
 
-        let mut evidence = Vec::new();
-        for declaration in declarations {
-            evidence.push(manifest_evidence(
-                declaration.id,
-                declaration.path,
-                declaration.section,
-            )?);
-        }
-        evidence.extend(transitive_evidence(&edges, "Cargo.lock".into())?);
-        ProjectSnapshot::new(root.to_path_buf(), components, edges).with_evidence(evidence)
+        ProjectSnapshot::new(root.to_path_buf(), components, edges).with_units(units)
     }
 }
 
@@ -164,8 +157,9 @@ struct CargoManifestRecord {
 
 #[derive(Debug)]
 struct ResolvedDeclaration {
+    name: String,
     id: ComponentId,
-    path: PathBuf,
+    unit_root: PathBuf,
     section: ManifestSection,
 }
 
@@ -315,9 +309,11 @@ fn resolve_manifest_declarations(
                 }
             }
             resolved.retain(|id| id.location.is_some());
+            let unit_root = record.path.parent().unwrap_or(Path::new("")).to_path_buf();
             declarations.extend(resolved.into_iter().map(|id| ResolvedDeclaration {
+                name: declaration.alias.clone(),
                 id,
-                path: record.path.clone(),
+                unit_root: unit_root.clone(),
                 section: declaration.section,
             }));
         }
@@ -325,13 +321,49 @@ fn resolve_manifest_declarations(
     declarations.sort_by(|left, right| {
         left.id
             .cmp(&right.id)
-            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.unit_root.cmp(&right.unit_root))
+            .then_with(|| left.name.cmp(&right.name))
             .then_with(|| left.section.cmp(&right.section))
     });
     declarations.dedup_by(|left, right| {
-        left.id == right.id && left.path == right.path && left.section == right.section
+        left.id == right.id
+            && left.name == right.name
+            && left.unit_root == right.unit_root
+            && left.section == right.section
     });
     declarations
+}
+
+fn cargo_project_units(
+    manifests: &[CargoManifestRecord],
+    declarations: &[ResolvedDeclaration],
+) -> Vec<ProjectUnit> {
+    manifests
+        .iter()
+        .map(|record| {
+            let unit_root = record.path.parent().unwrap_or(Path::new("")).to_path_buf();
+            ProjectUnit::new(
+                unit_root.clone(),
+                record.path.clone(),
+                Ecosystem::Cargo,
+                declarations
+                    .iter()
+                    .filter(|declaration| declaration.unit_root == unit_root)
+                    .map(|declaration| UnitDeclaration {
+                        name: declaration.alias_identifier(),
+                        component: declaration.id.clone(),
+                        section: declaration.section,
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+impl ResolvedDeclaration {
+    fn alias_identifier(&self) -> String {
+        self.name.replace('-', "_")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -483,48 +515,4 @@ fn collect_manifest_declarations(
             section,
         });
     }
-}
-
-/// Return unambiguous Rust source identifiers and their published package names
-/// across the root manifest and every declared Cargo workspace member.
-pub(crate) fn cargo_manifest_aliases(root: &Path) -> Result<HashMap<String, String>> {
-    let external_names: HashSet<_> = read_lockfile(&root.join("Cargo.lock"))?
-        .package
-        .into_iter()
-        .filter(|package| package.source.is_some())
-        .map(|package| package.name)
-        .collect();
-    let mut aliases = HashMap::new();
-    let mut conflicts = HashSet::new();
-    for record in read_manifests(root)? {
-        for declaration in record.manifest.declarations() {
-            if !external_names.contains(&declaration.package) {
-                continue;
-            }
-            let identifier = declaration.alias.replace('-', "_");
-            if aliases
-                .get(&identifier)
-                .is_some_and(|package| package != &declaration.package)
-            {
-                aliases.remove(&identifier);
-                conflicts.insert(identifier);
-            } else if !conflicts.contains(&identifier) {
-                aliases.insert(identifier, declaration.package);
-            }
-        }
-    }
-    Ok(aliases)
-}
-
-/// Return the root and declared workspace package directories. Source analysis
-/// uses this boundary to avoid attributing nested fixture/example projects to
-/// the project currently being analyzed.
-pub(crate) fn cargo_manifest_roots(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut roots: Vec<_> = read_manifests(root)?
-        .into_iter()
-        .filter_map(|record| record.path.parent().map(|path| root.join(path)))
-        .collect();
-    roots.sort();
-    roots.dedup();
-    Ok(roots)
 }

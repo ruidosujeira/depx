@@ -12,7 +12,7 @@ use crate::graph::DependencyGraph;
 use crate::model::{Component, ComponentId, Ecosystem};
 use crate::types::{DeprecatedPackage, Severity, Vulnerability};
 
-pub const PLAN_SCHEMA_VERSION: u32 = 1;
+pub const PLAN_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -92,36 +92,29 @@ pub fn build_plan(
         .iter()
         .map(|assessment| (&assessment.component, assessment))
         .collect();
-    let mut by_name_version: BTreeMap<(String, String), Vec<&Component>> = BTreeMap::new();
-    for component in &analysis.snapshot.components {
-        by_name_version
-            .entry((component.id.name.clone(), component.id.version.clone()))
-            .or_default()
-            .push(component);
-    }
-
     let mut actions = Vec::new();
     let mut represented_findings = HashSet::new();
-    let mut vulnerability_groups: BTreeMap<(String, String), Vec<&Vulnerability>> = BTreeMap::new();
+    let mut vulnerability_groups: BTreeMap<ComponentId, Vec<&Vulnerability>> = BTreeMap::new();
     for vulnerability in vulnerabilities {
         vulnerability_groups
-            .entry((
-                vulnerability.package_name.clone(),
-                vulnerability.installed_version.clone(),
-            ))
+            .entry(vulnerability.component.clone())
             .or_default()
             .push(vulnerability);
     }
 
-    for ((name, version), group) in vulnerability_groups {
-        let Some(components) = by_name_version.get(&(name.clone(), version.clone())) else {
-            continue;
-        };
-        let component = components
+    for (component_id, group) in vulnerability_groups {
+        let component = analysis
+            .snapshot
+            .components
             .iter()
-            .copied()
-            .find(|component| component.direct)
-            .unwrap_or(components[0]);
+            .find(|component| component.id == component_id)
+            .ok_or_else(|| {
+                miette::miette!(
+                    "Vulnerability references a component outside the analysis snapshot"
+                )
+            })?;
+        let name = &component.id.name;
+        let version = &component.id.version;
         let assessment = assessment_for(&assessments, &component.id);
         let explanation = graph.explain_component(&component.id).ok();
         let chains = explanation
@@ -133,7 +126,7 @@ pub fn build_plan(
             .iter()
             .map(|vulnerability| vulnerability.severity)
             .max()
-            .unwrap_or(Severity::Medium);
+            .unwrap_or(Severity::Unknown);
         let reachable = group
             .iter()
             .any(|vulnerability| vulnerability.affects_used_code);
@@ -204,7 +197,7 @@ pub fn build_plan(
             target_version: target_version.clone(),
             change_risk: target_version
                 .as_deref()
-                .map_or(ChangeRisk::Unknown, |target| change_risk(&version, target)),
+                .map_or(ChangeRisk::Unknown, |target| change_risk(version, target)),
             advisory_ids,
             finding_ids: related_findings,
             dependency_chains: chains,
@@ -422,6 +415,7 @@ fn security_priority(severity: Severity, reachable: bool) -> PlanPriority {
         (Severity::Critical, true) => PlanPriority::Urgent,
         (Severity::Critical | Severity::High, _) => PlanPriority::High,
         (Severity::Medium, true) => PlanPriority::Medium,
+        (Severity::Unknown, _) => PlanPriority::Low,
         _ => PlanPriority::Low,
     }
 }
@@ -564,18 +558,29 @@ mod tests {
         (component, evidence)
     }
 
-    fn vulnerability(used: bool) -> Vulnerability {
+    fn vulnerability_for(component: ComponentId, used: bool) -> Vulnerability {
         Vulnerability {
+            component,
             id: "GHSA-test".to_string(),
             title: "Test vulnerability".to_string(),
             severity: Severity::Critical,
-            package_name: "minimist".to_string(),
             vulnerable_range: "<1.2.6".to_string(),
             patched_version: Some("1.2.6".to_string()),
             url: None,
             affects_used_code: used,
-            installed_version: "1.2.5".to_string(),
         }
+    }
+
+    fn vulnerability(used: bool) -> Vulnerability {
+        vulnerability_for(
+            ComponentId {
+                ecosystem: Ecosystem::Npm,
+                name: "minimist".to_string(),
+                version: "1.2.5".to_string(),
+                location: Some("node_modules/minimist".to_string()),
+            },
+            used,
+        )
     }
 
     #[test]
@@ -616,5 +621,35 @@ mod tests {
         assert_eq!(plan.actions[0].kind, PlanActionKind::ReviewRemoval);
         assert!(plan.actions[0].reason.contains("review removal"));
         assert!(plan.actions[0].command.is_none());
+    }
+
+    #[test]
+    fn vulnerability_plan_never_reconstructs_same_version_by_name() {
+        let (first, first_evidence) = component("minimist", true);
+        let mut second = first.clone();
+        second.id.location = Some("node_modules/parent/node_modules/minimist".to_string());
+        second.direct = false;
+        let snapshot =
+            ProjectSnapshot::new(".".into(), vec![first.clone(), second.clone()], Vec::new())
+                .with_evidence(first_evidence)
+                .unwrap();
+        let analysis = analyze_project(
+            snapshot,
+            AnalysisCoverage::new(vec![CoverageArea::StaticImports], Vec::new()),
+        )
+        .unwrap();
+        let plan = build_plan(
+            &analysis,
+            &[vulnerability_for(second.id.clone(), false)],
+            &[],
+        )
+        .unwrap();
+        let security = plan
+            .actions
+            .iter()
+            .find(|action| action.kind == PlanActionKind::SecurityUpgrade)
+            .unwrap();
+        assert_eq!(security.component, second.id);
+        assert_ne!(security.component, first.id);
     }
 }

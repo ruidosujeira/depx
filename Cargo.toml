@@ -36,6 +36,7 @@ miette = { version = "7", features = ["fancy"] }
 # Async & HTTP
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
+httpdate = "1"
 
 # Utilities
 ignore = "0.4"

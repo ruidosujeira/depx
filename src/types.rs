@@ -106,6 +106,8 @@ pub struct PackageExplanation {
 /// A known vulnerability
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Vulnerability {
+    /// Exact affected installation/locator. This is the authoritative identity.
+    pub component: ComponentId,
     /// CVE or GHSA identifier
     pub id: String,
 
@@ -114,9 +116,6 @@ pub struct Vulnerability {
 
     /// Severity level
     pub severity: Severity,
-
-    /// Affected package name
-    pub package_name: String,
 
     /// Affected version range
     pub vulnerable_range: String,
@@ -129,14 +128,12 @@ pub struct Vulnerability {
 
     /// Whether this vulnerability affects code that is actually used
     pub affects_used_code: bool,
-
-    /// The installed version that is vulnerable
-    pub installed_version: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
+    Unknown,
     Low,
     Medium,
     High,
@@ -146,6 +143,7 @@ pub enum Severity {
 impl std::fmt::Display for Severity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Severity::Unknown => write!(f, "unknown"),
             Severity::Low => write!(f, "low"),
             Severity::Medium => write!(f, "medium"),
             Severity::High => write!(f, "high"),
@@ -177,19 +175,33 @@ pub struct DuplicateGroup {
 
     /// Severity level based on version differences
     pub severity: DuplicateSeverity,
+
+    /// Objective count of distinct resolved installations in this group.
+    pub installation_count: usize,
+
+    /// Objective count of parseable distinct major versions.
+    pub major_version_count: usize,
+
+    /// Additional compile units beyond a single resolved installation.
+    pub extra_compile_units: usize,
 }
 
 /// A specific version of a duplicated crate
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuplicateVersion {
+    /// Exact resolved installation represented by this row.
+    pub component: ComponentId,
     /// The version string
     pub version: String,
 
     /// Packages that depend on this version
     pub dependents: Vec<String>,
 
-    /// Number of transitive dependents
-    pub transitive_count: usize,
+    /// Exact immediate dependent installations.
+    pub dependent_components: Vec<ComponentId>,
+
+    /// Direct dependency roots from which this installation is reachable.
+    pub direct_roots: Vec<ComponentId>,
 }
 
 /// Severity of the duplicate based on version differences
@@ -200,8 +212,6 @@ pub enum DuplicateSeverity {
     Low,
     /// Different major versions (potential issues)
     Medium,
-    /// 3+ different major versions (likely problematic)
-    High,
 }
 
 impl std::fmt::Display for DuplicateSeverity {
@@ -209,7 +219,6 @@ impl std::fmt::Display for DuplicateSeverity {
         match self {
             DuplicateSeverity::Low => write!(f, "low"),
             DuplicateSeverity::Medium => write!(f, "medium"),
-            DuplicateSeverity::High => write!(f, "high"),
         }
     }
 }
@@ -217,6 +226,8 @@ impl std::fmt::Display for DuplicateSeverity {
 /// Result of analyzing duplicate dependencies
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuplicateAnalysis {
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: u32,
     /// All duplicate groups found
     pub duplicates: Vec<DuplicateGroup>,
 
@@ -229,9 +240,6 @@ pub struct DuplicateAnalysis {
 pub struct DuplicateStats {
     /// Total number of crates with duplicates
     pub total_duplicates: usize,
-
-    /// Number of high severity duplicates
-    pub high_severity: usize,
 
     /// Number of medium severity duplicates
     pub medium_severity: usize,

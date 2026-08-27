@@ -28,7 +28,7 @@ pub fn serialize_sarif(analysis: &ProjectAnalysis) -> Result<String> {
                 "ruleId": finding.rule.as_str(),
                 "level": sarif_level(finding.severity),
                 "message": { "text": finding.explanation },
-                "fingerprints": { "depx/v1": finding.id.as_str() },
+                "fingerprints": { "depx/v2": finding.id.as_str() },
                 "properties": {
                     "component": finding.subject,
                     "confidence": finding.confidence,
@@ -141,7 +141,7 @@ mod tests {
                 ["uri"],
             "package.json"
         );
-        assert!(sarif["runs"][0]["results"][0]["fingerprints"]["depx/v1"]
+        assert!(sarif["runs"][0]["results"][0]["fingerprints"]["depx/v2"]
             .as_str()
             .unwrap()
             .starts_with("fd-"));

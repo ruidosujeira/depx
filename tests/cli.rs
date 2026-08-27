@@ -54,6 +54,10 @@ fn baseline_suppresses_existing_findings_but_preserves_the_gate() {
         .unwrap();
     assert!(baseline.status.success());
     assert!(root.join("depx-baseline.json").is_file());
+    let baseline_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join("depx-baseline.json")).unwrap())
+            .unwrap();
+    assert_eq!(baseline_json["schemaVersion"], 2);
 
     let analyzed = depx()
         .args([
@@ -70,6 +74,43 @@ fn baseline_suppresses_existing_findings_but_preserves_the_gate() {
     assert!(value["findings"].as_array().unwrap().is_empty());
 
     fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn analysis_json_exposes_versioned_project_units() {
+    let output = depx()
+        .args([
+            "analyze",
+            project("tests/fixtures/npm-workspace").to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schemaVersion"], 2);
+    assert_eq!(value["units"].as_array().unwrap().len(), 2);
+    assert!(value["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|evidence| { evidence["owner"] == "unit:packages/app" }));
+}
+
+#[test]
+fn duplicate_json_is_versioned_and_informational() {
+    let output = depx()
+        .args([
+            "duplicates",
+            project("tests/fixtures/cargo-normalized").to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schemaVersion"], 2);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("transitive_count"));
 }
 
 fn temporary_project() -> PathBuf {

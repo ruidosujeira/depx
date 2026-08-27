@@ -77,7 +77,7 @@ Dependency Remediation Plan
    Suggested command: npm install minimist@1.2.6
 ```
 
-Priority is based on advisory severity and observed reachability. Direct dependencies get package-manager-aware commands; transitive findings identify the remediation root and dependency chain. `--verbose` shows all chains and `--json` emits the stable plan schema.
+Priority is based on advisory severity and observed reachability. Direct dependencies get package-manager-aware commands; transitive findings identify the remediation root and dependency chain. `--verbose` shows up to five shortest useful chains per component and `--json` emits the versioned plan schema.
 
 ```bash
 depx plan
@@ -126,7 +126,7 @@ depx why wrappy
 depx why shared@2.0.0
 ```
 
-`why` shows declaration or transitive presence evidence, every resolved chain from a direct dependency, source evidence, confidence, coverage limitations and related findings. Qualify the version when multiple installed components share the same package name.
+`why` shows declaration or transitive presence evidence, source evidence, confidence, coverage limitations, related findings and up to five shortest useful chains from direct dependencies. Chain traversal is deterministic, cycle-safe and bounded for dense graphs. Qualify the version when multiple installed components share the same package name; when the same name/version has multiple installation locations, the CLI reports the ambiguity instead of guessing.
 
 ## Vulnerability gates
 
@@ -139,7 +139,9 @@ depx audit --fail-on critical
 depx audit --fail-on never
 ```
 
-The default threshold is `high`. Accepted values are `any`, `low`, `medium`, `high`, `critical` and `never`.
+The default threshold is `high`. Accepted values are `any`, `low`, `medium`, `high`, `critical` and `never`. Advisories without a usable textual severity or CVSS score are reported as `unknown`, never silently promoted to `medium`. `any` fails on unknown severity; numeric severity thresholds do not.
+
+OSV requests use three bounded attempts for transient network errors and HTTP `429`, `500`, `502`, `503` and `504`, honoring a capped `Retry-After` value when present. If the final attempt fails, the audit fails closed as an operational error instead of reporting a clean result.
 
 Exit codes:
 
@@ -192,7 +194,7 @@ For a code-scanning system, save SARIF without changing the result stream:
 depx analyze --sarif > depx.sarif
 ```
 
-JSON, baseline identities, plan action IDs and SARIF fingerprints are deterministic for the same project state.
+JSON, semantic baseline identities, plan action IDs and SARIF fingerprints are deterministic for the same project state. Finding fingerprints are independent from byte-offset-only source edits; evidence locations and spans remain available for diagnostics.
 
 ## Deprecated and duplicate packages
 
@@ -203,7 +205,7 @@ depx duplicates --verbose
 depx duplicates --json
 ```
 
-`deprecated` marks whether each package has observed usage. `duplicates` analyzes Cargo crates with multiple resolved versions, ranks multiple-major and repeated-version cases and estimates extra compile units. It exits with code `1` when high-severity duplicate sets are present.
+`deprecated` marks whether each package has observed usage. `duplicates` analyzes Cargo crates with multiple resolved versions and reports objective facts: exact installations, immediate dependents, direct roots, distinct majors and extra compile units. Three versions within one major remain low impact; different majors are medium impact. The command is informational and does not hard-code a CI failure from version count. Use policy-controlled `depx analyze --fail-on ...` and rule `DX004` when duplicate findings should gate CI.
 
 ## Supported project formats
 
@@ -214,7 +216,9 @@ depx duplicates --json
 | Yarn classic and modern `yarn.lock` | graph, workspaces and analysis |
 | Rust `Cargo.lock` + `Cargo.toml` | graph, workspaces, renamed crates, analysis and duplicates |
 
-JavaScript/TypeScript evidence includes static imports, CommonJS `require`, dynamic imports, re-exports, supported configuration files and root package scripts. Rust evidence includes `use`, `extern crate`, crate-qualified paths and macro references, classified across runtime, build, test and development sources.
+JavaScript/TypeScript evidence includes static imports, CommonJS `require`, dynamic imports, re-exports, supported configuration files and scripts from every declared project unit. Node built-ins and their subpaths (for example `fs/promises`, `assert/strict` and `node:test`) are excluded. Rust evidence includes `use`, `extern crate`, crate-qualified paths and macro references, classified across runtime, build, test and development sources.
+
+Workspace manifests become explicit project units. Each source observation is owned by its most specific declared unit and resolves only through that unit's exact declarations and package-manager context. Valid workspace members are scanned; unrelated nested projects are excluded. Yarn Berry locators, including virtual peer contexts, and pnpm peer-qualified locations remain distinct component identities.
 
 Static analysis cannot prove absence. depx reports coverage limitations for computed module names, framework plugin discovery, arbitrary shell behavior, generated sources, conditional Rust compilation and macro expansion.
 
@@ -223,12 +227,18 @@ Static analysis cannot prove absence. depx reports coverage limitations for comp
 | Stage | What happens |
 |-------|--------------|
 | Inventory | Parses the detected lockfile into normalized, versioned component identities and dependency edges. |
-| Manifests | Resolves direct declarations, roles, workspace members and package/crate aliases. |
-| Evidence | Collects source, script and configuration references with origin, role, confidence and exact or ambiguous resolution. |
+| Manifests | Produces explicit project units and resolves each declaration to an exact component in its package-manager context. |
+| Evidence | Collects unit-owned source, script and configuration references with origin, role, confidence and exact or explicit ambiguous resolution. |
 | Findings | Applies validated rules with stable IDs and explicit recommendations. |
 | Advisories | Sends exact installed versions to OSV and marks observed reachability. |
 | Decisions | Produces prioritized remediation actions, upgrade risk, commands and dependency roots. |
 | Governance | Applies justified exceptions, baselines, failure thresholds and machine-readable output. |
+
+The dependency direction is intentionally one-way: ecosystem adapters → normalized model/project units → evidence → usage assessment → findings → graph/advisories → remediation plan → policy and output. Finding rules do not contain package-manager resolution logic.
+
+## Machine-readable schemas
+
+Public machine-readable formats are explicitly versioned. The current analysis/finding schema, baseline schema, remediation-plan schema and duplicate-analysis schema are version `2`; SARIF uses the `depx/v2` fingerprint key. Version 2 introduces project units and evidence ownership, exact vulnerability component identity, semantic finding fingerprints and objective duplicate facts. Version 1 baselines must be regenerated with `depx baseline` because their occurrence-sensitive IDs are intentionally incompatible. See [docs/schemas.md](docs/schemas.md) for compatibility details.
 
 ## Development
 
@@ -238,7 +248,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 ```
 
-See [CHANGELOG.md](CHANGELOG.md) for release notes.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, [SECURITY.md](SECURITY.md) for private vulnerability reporting and [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Built with AI
 
