@@ -743,6 +743,9 @@ fn limitation_label(limitation: CoverageLimitation) -> &'static str {
         CoverageLimitation::UnresolvedPackageReferences => {
             "package references that did not resolve to installed components"
         }
+        CoverageLimitation::UnclassifiedRustReferences => {
+            "Rust paths that source syntax cannot classify as local or external"
+        }
         CoverageLimitation::RustConditionalCompilation => {
             "Rust feature and cfg-dependent reachability"
         }

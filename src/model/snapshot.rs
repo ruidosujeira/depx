@@ -6,13 +6,15 @@ use serde::{Deserialize, Serialize};
 use crate::evidence::Evidence;
 use crate::evidence::EvidenceResolution;
 
-use super::{Component, DependencyEdge, ProjectUnit, ProjectUnitId};
+use super::{Component, DependencyEdge, PackageManager, ProjectUnit, ProjectUnitId};
 
 /// Immutable normalized inventory and dependency evidence for one project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectSnapshot {
     /// Project root from which ecosystem files were read.
     pub root: PathBuf,
+    /// Package manager that produced this normalized snapshot.
+    pub package_manager: Option<PackageManager>,
     /// Deterministically ordered resolved component inventory.
     pub components: Vec<Component>,
     /// Deterministically ordered resolved dependency relationships.
@@ -35,11 +37,19 @@ impl ProjectSnapshot {
         dependency_edges.dedup();
         Self {
             root,
+            package_manager: None,
             components,
             dependency_edges,
             units: Vec::new(),
             evidence: Vec::new(),
         }
+    }
+
+    /// Retain the adapter identity without making downstream layers inspect files.
+    pub fn with_package_manager(mut self, package_manager: PackageManager) -> Result<Self> {
+        self.package_manager = Some(package_manager);
+        self.validate()?;
+        Ok(self)
     }
 
     /// Attach the project/workspace units discovered by the ecosystem adapter.
@@ -100,6 +110,12 @@ impl ProjectSnapshot {
             .first()
             .map(|component| component.id.ecosystem)
             .or_else(|| self.units.first().map(|unit| unit.ecosystem));
+        if self
+            .package_manager
+            .is_some_and(|manager| Some(manager.ecosystem()) != expected_ecosystem)
+        {
+            bail!("Snapshot package manager does not match its ecosystem");
+        }
         if self.components.iter().any(|component| {
             expected_ecosystem.is_some_and(|ecosystem| component.id.ecosystem != ecosystem)
         }) {
@@ -327,6 +343,7 @@ mod tests {
         let unknown = component("unknown");
         let snapshot = ProjectSnapshot {
             root: PathBuf::from("."),
+            package_manager: None,
             components: vec![known.clone()],
             dependency_edges: vec![DependencyEdge {
                 from: known.id,

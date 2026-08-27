@@ -54,6 +54,7 @@ pub(super) fn project_units(
                     })
                     .collect(),
             )
+            .with_name(record.manifest.name.clone())
         })
         .collect()
 }
@@ -61,6 +62,7 @@ pub(super) fn project_units(
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct PackageJson {
+    name: Option<String>,
     #[serde(default)]
     dependencies: HashMap<String, String>,
     #[serde(default)]

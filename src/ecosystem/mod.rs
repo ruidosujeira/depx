@@ -56,7 +56,7 @@ mod tests {
 
     use super::*;
     use crate::graph::{DependencyGraph, ExplainError};
-    use crate::model::DependencyKind;
+    use crate::model::{DependencyKind, PackageManager};
 
     fn fixture(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -129,6 +129,10 @@ mod tests {
                     .any(|declaration| declaration.component == is_odd.id)
         }));
         assert_eq!(snapshot.units.len(), 2);
+        assert_eq!(snapshot.package_manager, Some(PackageManager::Npm));
+        assert!(snapshot.units.iter().any(|unit| {
+            unit.root == Path::new("packages/app") && unit.name.as_deref() == Some("app")
+        }));
     }
 
     #[test]
@@ -210,6 +214,10 @@ mod tests {
                     .iter()
                     .any(|declaration| declaration.component == yansi.id)
         }));
+        assert_eq!(snapshot.package_manager, Some(PackageManager::Cargo));
+        assert!(snapshot.units.iter().any(|unit| {
+            unit.root == Path::new("crates/app") && unit.name.as_deref() == Some("app")
+        }));
     }
 
     #[test]
@@ -236,6 +244,10 @@ mod tests {
                     .any(|declaration| declaration.component == is_odd.id)
         }));
         assert_eq!(snapshot.units.len(), 2);
+        assert_eq!(snapshot.package_manager, Some(PackageManager::Pnpm));
+        assert!(snapshot.units.iter().any(|unit| {
+            unit.root == Path::new("packages/app") && unit.name.as_deref() == Some("app")
+        }));
         assert!(snapshot.dependency_edges.iter().any(|edge| {
             edge.from == is_odd.id && edge.to.name == "is-number" && edge.to.version == "6.0.0"
         }));
@@ -265,6 +277,10 @@ mod tests {
                     .any(|declaration| declaration.component == is_odd.id)
         }));
         assert_eq!(snapshot.units.len(), 2);
+        assert_eq!(snapshot.package_manager, Some(PackageManager::Yarn));
+        assert!(snapshot.units.iter().any(|unit| {
+            unit.root == Path::new("packages/app") && unit.name.as_deref() == Some("app")
+        }));
         assert!(snapshot.dependency_edges.iter().any(|edge| {
             edge.from == is_odd.id && edge.to.name == "is-number" && edge.to.version == "6.0.0"
         }));

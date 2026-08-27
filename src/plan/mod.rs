@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use miette::{IntoDiagnostic, Result};
 use semver::Version;
@@ -9,10 +9,12 @@ use crate::analysis::{UsageAssessment, UsageState};
 use crate::evidence::Confidence;
 use crate::finding::{DuplicateKind, FindingDetails, ProjectAnalysis};
 use crate::graph::DependencyGraph;
-use crate::model::{Component, ComponentId, Ecosystem};
+use crate::model::{
+    Component, ComponentId, Ecosystem, PackageManager, ProjectSnapshot, ProjectUnit, ProjectUnitId,
+};
 use crate::types::{DeprecatedPackage, Severity, Vulnerability};
 
-pub const PLAN_SCHEMA_VERSION: u32 = 2;
+pub const PLAN_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,6 +52,8 @@ pub struct PlanAction {
     pub kind: PlanActionKind,
     pub component: ComponentId,
     pub root_component: Option<ComponentId>,
+    /// Project units with declarations resolved to this exact component.
+    pub owners: Vec<ProjectUnitId>,
     pub usage: UsageState,
     pub confidence: Confidence,
     pub title: String,
@@ -122,6 +126,7 @@ pub fn build_plan(
             .map(|item| item.dependency_chains.clone())
             .unwrap_or_default();
         let root_component = remediation_root(component, &chains);
+        let owners = declaration_owners(&analysis.snapshot, &component.id);
         let max_severity = group
             .iter()
             .map(|vulnerability| vulnerability.severity)
@@ -182,7 +187,8 @@ pub fn build_plan(
                 direct_update_command(
                     component,
                     target_version.as_deref(),
-                    &analysis.snapshot.root,
+                    &analysis.snapshot,
+                    &owners,
                 )
             })
             .flatten();
@@ -191,6 +197,7 @@ pub fn build_plan(
             kind,
             component: component.id.clone(),
             root_component,
+            owners,
             assessment,
             title,
             reason,
@@ -213,6 +220,7 @@ pub fn build_plan(
             .map(|value| value.dependency_chains.clone())
             .unwrap_or_default();
         let root_component = remediation_root(&item.package, &chains);
+        let owners = declaration_owners(&analysis.snapshot, &item.package.id);
         actions.push(new_action(ActionInput {
             priority: if item.is_used {
                 PlanPriority::High
@@ -222,6 +230,7 @@ pub fn build_plan(
             kind: PlanActionKind::ReplaceDeprecated,
             component: item.package.id.clone(),
             root_component,
+            owners,
             assessment,
             title: format!("Replace deprecated {}", item.package.id.qualified_name()),
             reason: item.message.clone(),
@@ -289,11 +298,13 @@ pub fn build_plan(
             .as_ref()
             .map(|value| value.dependency_chains.clone())
             .unwrap_or_default();
+        let owners = declaration_owners(&analysis.snapshot, &component.id);
         actions.push(new_action(ActionInput {
             priority,
             kind,
             component: component.id.clone(),
             root_component: remediation_root(component, &chains),
+            owners,
             assessment,
             title,
             reason: finding.explanation.clone(),
@@ -337,6 +348,7 @@ struct ActionInput {
     kind: PlanActionKind,
     component: ComponentId,
     root_component: Option<ComponentId>,
+    owners: Vec<ProjectUnitId>,
     assessment: UsageAssessment,
     title: String,
     reason: String,
@@ -352,6 +364,7 @@ fn new_action(input: ActionInput) -> Result<PlanAction> {
     let identity = serde_json::to_vec(&(
         input.kind,
         &input.component,
+        &input.owners,
         &input.advisory_ids,
         &input.finding_ids,
     ))
@@ -362,6 +375,7 @@ fn new_action(input: ActionInput) -> Result<PlanAction> {
         kind: input.kind,
         component: input.component,
         root_component: input.root_component,
+        owners: input.owners,
         usage: input.assessment.state,
         confidence: input.assessment.confidence,
         title: input.title,
@@ -395,6 +409,22 @@ fn remediation_root(component: &Component, chains: &[Vec<ComponentId>]) -> Optio
         return Some(component.id.clone());
     }
     chains.first().and_then(|chain| chain.first()).cloned()
+}
+
+fn declaration_owners(snapshot: &ProjectSnapshot, component: &ComponentId) -> Vec<ProjectUnitId> {
+    let mut owners: Vec<_> = snapshot
+        .units
+        .iter()
+        .filter(|unit| {
+            unit.declarations
+                .iter()
+                .any(|declaration| declaration.component == *component)
+        })
+        .map(|unit| unit.id.clone())
+        .collect();
+    owners.sort();
+    owners.dedup();
+    owners
 }
 
 fn highest_fixed_version(vulnerabilities: &[&Vulnerability]) -> Option<String> {
@@ -436,25 +466,117 @@ fn change_risk(current: &str, target: &str) -> ChangeRisk {
 fn direct_update_command(
     component: &Component,
     target: Option<&str>,
-    project_root: &Path,
+    snapshot: &ProjectSnapshot,
+    owners: &[ProjectUnitId],
 ) -> Option<String> {
-    if !component.direct {
+    if !component.direct || owners.len() != 1 {
         return None;
     }
     let target = target?;
-    Some(match component.id.ecosystem {
-        Ecosystem::Npm if project_root.join("pnpm-lock.yaml").is_file() => {
-            format!("pnpm update --recursive {}@{}", component.id.name, target)
+    let owner = snapshot.unit(&owners[0])?;
+    match snapshot.package_manager? {
+        PackageManager::Npm | PackageManager::Pnpm | PackageManager::Yarn => {
+            javascript_update_command(snapshot, owner, component, target)
         }
-        Ecosystem::Npm if project_root.join("yarn.lock").is_file() => {
-            let modern = std::fs::read_to_string(project_root.join("yarn.lock"))
-                .is_ok_and(|lockfile| lockfile.lines().any(|line| line.trim() == "__metadata:"));
-            let verb = if modern { "up" } else { "upgrade" };
-            format!("yarn {verb} {}@{}", component.id.name, target)
-        }
-        Ecosystem::Npm => format!("npm install {}@{}", component.id.name, target),
-        Ecosystem::Cargo => format!("cargo update -p {} --precise {}", component.id.name, target),
+        PackageManager::Cargo => cargo_update_command(snapshot, component, target),
+    }
+}
+
+fn javascript_update_command(
+    snapshot: &ProjectSnapshot,
+    owner: &ProjectUnit,
+    component: &Component,
+    target: &str,
+) -> Option<String> {
+    if component.id.ecosystem != Ecosystem::Npm
+        || !valid_npm_name(&component.id.name)
+        || Version::parse(target).is_err()
+    {
+        return None;
+    }
+    let package = format!("{}@{target}", component.id.name);
+    if owner.root.as_os_str().is_empty() {
+        return Some(match snapshot.package_manager? {
+            PackageManager::Npm => format!("npm install {package}"),
+            PackageManager::Pnpm => format!("pnpm update {package}"),
+            PackageManager::Yarn => format!("yarn add {package}"),
+            PackageManager::Cargo => return None,
+        });
+    }
+
+    let workspace = exact_workspace_name(snapshot, owner)?;
+    Some(match snapshot.package_manager? {
+        PackageManager::Npm => format!("npm install {package} --workspace {workspace}"),
+        PackageManager::Pnpm => format!("pnpm --filter {workspace} update {package}"),
+        PackageManager::Yarn => format!("yarn workspace {workspace} add {package}"),
+        PackageManager::Cargo => return None,
     })
+}
+
+fn exact_workspace_name<'a>(
+    snapshot: &'a ProjectSnapshot,
+    owner: &'a ProjectUnit,
+) -> Option<&'a str> {
+    let name = owner.name.as_deref().filter(|name| valid_npm_name(name))?;
+    (snapshot
+        .units
+        .iter()
+        .filter(|unit| unit.name.as_deref() == Some(name))
+        .count()
+        == 1)
+        .then_some(name)
+}
+
+fn cargo_update_command(
+    snapshot: &ProjectSnapshot,
+    component: &Component,
+    target: &str,
+) -> Option<String> {
+    if component.id.ecosystem != Ecosystem::Cargo
+        || component.id.location.is_none()
+        || !valid_cargo_name(&component.id.name)
+        || Version::parse(&component.id.version).is_err()
+        || Version::parse(target).is_err()
+    {
+        return None;
+    }
+    let same_package_id = snapshot
+        .components
+        .iter()
+        .filter(|candidate| {
+            candidate.id.name == component.id.name && candidate.id.version == component.id.version
+        })
+        .count();
+    if same_package_id != 1 {
+        return None;
+    }
+    Some(format!(
+        "cargo update -p {}@{} --precise {target}",
+        component.id.name, component.id.version
+    ))
+}
+
+fn valid_npm_name(value: &str) -> bool {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"@/._-".contains(&byte))
+    {
+        return false;
+    }
+    if let Some(scoped) = value.strip_prefix('@') {
+        return scoped
+            .split_once('/')
+            .is_some_and(|(scope, package)| !scope.is_empty() && !package.is_empty());
+    }
+    !value.contains('/') && !value.starts_with(['.', '_'])
+}
+
+fn valid_cargo_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn summarize(actions: &[PlanAction]) -> PlanSummary {
@@ -509,7 +631,10 @@ mod tests {
         SourceRole,
     };
     use crate::finding::analyze_project;
-    use crate::model::{Component, ComponentId, Ecosystem, ProjectSnapshot};
+    use crate::model::{
+        Component, ComponentId, Ecosystem, PackageManager, ProjectSnapshot, ProjectUnit,
+        ProjectUnitId, UnitDeclaration,
+    };
 
     fn component(name: &str, used: bool) -> (Component, Vec<Evidence>) {
         let component = Component {
@@ -523,7 +648,9 @@ mod tests {
             dev: false,
             deprecated: None,
         };
-        let mut evidence = vec![Evidence::new(
+        let owner = ProjectUnitId::from_root(std::path::Path::new(""));
+        let mut evidence = vec![Evidence::new_for_unit(
+            owner.clone(),
             component.id.clone(),
             EvidenceKind::ManifestDeclaration {
                 section: ManifestSection::Dependencies,
@@ -540,7 +667,8 @@ mod tests {
         .unwrap()];
         if used {
             evidence.push(
-                Evidence::new(
+                Evidence::new_for_unit(
+                    owner,
                     component.id.clone(),
                     EvidenceKind::StaticImport,
                     EvidenceOrigin {
@@ -556,6 +684,42 @@ mod tests {
             );
         }
         (component, evidence)
+    }
+
+    fn unit(root: &str, name: Option<&str>, declarations: &[(&str, &ComponentId)]) -> ProjectUnit {
+        let root = PathBuf::from(root);
+        let manifest = root.join(match declarations.first().map(|(_, id)| id.ecosystem) {
+            Some(Ecosystem::Cargo) => "Cargo.toml",
+            _ => "package.json",
+        });
+        ProjectUnit::new(
+            root,
+            manifest,
+            declarations
+                .first()
+                .map_or(Ecosystem::Npm, |(_, id)| id.ecosystem),
+            declarations
+                .iter()
+                .map(|(name, component)| UnitDeclaration {
+                    name: (*name).to_string(),
+                    component: (*component).clone(),
+                    section: ManifestSection::Dependencies,
+                })
+                .collect(),
+        )
+        .with_name(name.map(str::to_string))
+    }
+
+    fn snapshot(
+        package_manager: PackageManager,
+        components: Vec<Component>,
+        units: Vec<ProjectUnit>,
+    ) -> ProjectSnapshot {
+        ProjectSnapshot::new(".".into(), components, Vec::new())
+            .with_units(units)
+            .unwrap()
+            .with_package_manager(package_manager)
+            .unwrap()
     }
 
     fn vulnerability_for(component: ComponentId, used: bool) -> Vulnerability {
@@ -586,9 +750,13 @@ mod tests {
     #[test]
     fn reachable_critical_vulnerability_becomes_urgent_patch_action() {
         let (component, evidence) = component("minimist", true);
-        let snapshot = ProjectSnapshot::new(".".into(), vec![component], Vec::new())
-            .with_evidence(evidence)
-            .unwrap();
+        let snapshot = snapshot(
+            PackageManager::Npm,
+            vec![component.clone()],
+            vec![unit("", Some("fixture"), &[("minimist", &component.id)])],
+        )
+        .with_evidence(evidence)
+        .unwrap();
         let analysis = analyze_project(
             snapshot,
             AnalysisCoverage::new(vec![CoverageArea::StaticImports], Vec::new()),
@@ -608,9 +776,13 @@ mod tests {
     #[test]
     fn vulnerable_dependency_without_usage_prefers_removal_review() {
         let (component, evidence) = component("minimist", false);
-        let snapshot = ProjectSnapshot::new(".".into(), vec![component], Vec::new())
-            .with_evidence(evidence)
-            .unwrap();
+        let snapshot = snapshot(
+            PackageManager::Npm,
+            vec![component.clone()],
+            vec![unit("", Some("fixture"), &[("minimist", &component.id)])],
+        )
+        .with_evidence(evidence)
+        .unwrap();
         let analysis = analyze_project(
             snapshot,
             AnalysisCoverage::new(vec![CoverageArea::StaticImports], Vec::new()),
@@ -629,10 +801,13 @@ mod tests {
         let mut second = first.clone();
         second.id.location = Some("node_modules/parent/node_modules/minimist".to_string());
         second.direct = false;
-        let snapshot =
-            ProjectSnapshot::new(".".into(), vec![first.clone(), second.clone()], Vec::new())
-                .with_evidence(first_evidence)
-                .unwrap();
+        let snapshot = snapshot(
+            PackageManager::Npm,
+            vec![first.clone(), second.clone()],
+            vec![unit("", Some("fixture"), &[("minimist", &first.id)])],
+        )
+        .with_evidence(first_evidence)
+        .unwrap();
         let analysis = analyze_project(
             snapshot,
             AnalysisCoverage::new(vec![CoverageArea::StaticImports], Vec::new()),
@@ -651,5 +826,338 @@ mod tests {
             .unwrap();
         assert_eq!(security.component, second.id);
         assert_ne!(security.component, first.id);
+    }
+
+    fn installed(
+        ecosystem: Ecosystem,
+        name: &str,
+        version: &str,
+        location: &str,
+        direct: bool,
+    ) -> Component {
+        Component {
+            id: ComponentId {
+                ecosystem,
+                name: name.to_string(),
+                version: version.to_string(),
+                location: Some(location.to_string()),
+            },
+            direct,
+            dev: false,
+            deprecated: None,
+        }
+    }
+
+    fn command_for(
+        snapshot: &ProjectSnapshot,
+        component: &Component,
+        target: &str,
+    ) -> Option<String> {
+        let owners = declaration_owners(snapshot, &component.id);
+        direct_update_command(component, Some(target), snapshot, &owners)
+    }
+
+    #[test]
+    fn npm_root_declaration_gets_a_root_scoped_command() {
+        let component = installed(
+            Ecosystem::Npm,
+            "minimist",
+            "1.2.5",
+            "node_modules/minimist",
+            true,
+        );
+        let snapshot = snapshot(
+            PackageManager::Npm,
+            vec![component.clone()],
+            vec![unit("", Some("root-app"), &[("minimist", &component.id)])],
+        );
+
+        assert_eq!(
+            command_for(&snapshot, &component, "1.2.6").as_deref(),
+            Some("npm install minimist@1.2.6")
+        );
+    }
+
+    #[test]
+    fn npm_nested_workspace_command_selects_the_exact_owner() {
+        let component = installed(
+            Ecosystem::Npm,
+            "minimist",
+            "1.2.5",
+            "packages/app/node_modules/minimist",
+            true,
+        );
+        let snapshot = snapshot(
+            PackageManager::Npm,
+            vec![component.clone()],
+            vec![unit(
+                "packages/app",
+                Some("nested-app"),
+                &[("minimist", &component.id)],
+            )],
+        );
+
+        assert_eq!(
+            command_for(&snapshot, &component, "1.2.6").as_deref(),
+            Some("npm install minimist@1.2.6 --workspace nested-app")
+        );
+    }
+
+    #[test]
+    fn one_installation_declared_by_multiple_units_has_no_single_command() {
+        let component = installed(
+            Ecosystem::Npm,
+            "shared",
+            "1.0.0",
+            "node_modules/shared",
+            true,
+        );
+        let snapshot = snapshot(
+            PackageManager::Npm,
+            vec![component.clone()],
+            vec![
+                unit("", Some("root-app"), &[("shared", &component.id)]),
+                unit(
+                    "packages/app",
+                    Some("nested-app"),
+                    &[("shared", &component.id)],
+                ),
+            ],
+        );
+
+        assert_eq!(declaration_owners(&snapshot, &component.id).len(), 2);
+        assert!(command_for(&snapshot, &component, "1.0.1").is_none());
+    }
+
+    #[test]
+    fn same_name_and_version_installations_remain_workspace_scoped() {
+        let first = installed(
+            Ecosystem::Npm,
+            "shared",
+            "1.0.0",
+            "packages/a/node_modules/shared",
+            true,
+        );
+        let second = installed(
+            Ecosystem::Npm,
+            "shared",
+            "1.0.0",
+            "packages/b/node_modules/shared",
+            true,
+        );
+        let snapshot = snapshot(
+            PackageManager::Npm,
+            vec![second.clone(), first.clone()],
+            vec![
+                unit("packages/b", Some("workspace-b"), &[("shared", &second.id)]),
+                unit("packages/a", Some("workspace-a"), &[("shared", &first.id)]),
+            ],
+        );
+
+        assert_eq!(
+            command_for(&snapshot, &first, "1.0.1").as_deref(),
+            Some("npm install shared@1.0.1 --workspace workspace-a")
+        );
+        assert_eq!(
+            command_for(&snapshot, &second, "1.0.1").as_deref(),
+            Some("npm install shared@1.0.1 --workspace workspace-b")
+        );
+    }
+
+    #[test]
+    fn pnpm_update_is_filtered_and_never_recursive() {
+        let component = installed(
+            Ecosystem::Npm,
+            "shared",
+            "1.0.0",
+            "packages/app/node_modules/shared",
+            true,
+        );
+        let snapshot = snapshot(
+            PackageManager::Pnpm,
+            vec![component.clone()],
+            vec![unit(
+                "packages/app",
+                Some("pnpm-app"),
+                &[("shared", &component.id)],
+            )],
+        );
+
+        let command = command_for(&snapshot, &component, "1.0.1").unwrap();
+        assert_eq!(command, "pnpm --filter pnpm-app update shared@1.0.1");
+        assert!(!command
+            .split_whitespace()
+            .any(|token| token == "--recursive"));
+    }
+
+    #[test]
+    fn yarn_update_selects_the_exact_workspace() {
+        let component = installed(
+            Ecosystem::Npm,
+            "shared",
+            "1.0.0",
+            "yarn:shared@npm:1.0.0",
+            true,
+        );
+        let snapshot = snapshot(
+            PackageManager::Yarn,
+            vec![component.clone()],
+            vec![unit(
+                "packages/app",
+                Some("yarn-app"),
+                &[("shared", &component.id)],
+            )],
+        );
+
+        assert_eq!(
+            command_for(&snapshot, &component, "1.0.1").as_deref(),
+            Some("yarn workspace yarn-app add shared@1.0.1")
+        );
+    }
+
+    #[test]
+    fn cargo_command_disambiguates_two_installed_versions() {
+        let old = installed(
+            Ecosystem::Cargo,
+            "time",
+            "0.3.30",
+            "registry+https://github.com/rust-lang/crates.io-index",
+            true,
+        );
+        let newer = installed(
+            Ecosystem::Cargo,
+            "time",
+            "0.3.36",
+            "registry+https://github.com/rust-lang/crates.io-index",
+            false,
+        );
+        let snapshot = snapshot(
+            PackageManager::Cargo,
+            vec![newer, old.clone()],
+            vec![unit("", Some("rust-app"), &[("time", &old.id)])],
+        );
+
+        assert_eq!(
+            command_for(&snapshot, &old, "0.3.31").as_deref(),
+            Some("cargo update -p time@0.3.30 --precise 0.3.31")
+        );
+    }
+
+    #[test]
+    fn transitive_or_unprovable_targets_never_get_direct_commands() {
+        let transitive = installed(
+            Ecosystem::Npm,
+            "transitive",
+            "1.0.0",
+            "node_modules/transitive",
+            false,
+        );
+        let direct = installed(
+            Ecosystem::Npm,
+            "direct",
+            "1.0.0",
+            "packages/app/node_modules/direct",
+            true,
+        );
+        let snapshot = snapshot(
+            PackageManager::Npm,
+            vec![transitive.clone(), direct.clone()],
+            vec![unit("packages/app", None, &[("direct", &direct.id)])],
+        );
+
+        assert!(command_for(&snapshot, &transitive, "1.0.1").is_none());
+        assert!(command_for(&snapshot, &direct, "1.0.1").is_none());
+    }
+
+    #[test]
+    fn cargo_same_name_version_from_multiple_sources_is_not_guessed() {
+        let registry = installed(
+            Ecosystem::Cargo,
+            "shared",
+            "1.0.0",
+            "registry+https://example.invalid/index",
+            true,
+        );
+        let git = installed(
+            Ecosystem::Cargo,
+            "shared",
+            "1.0.0",
+            "git+https://example.invalid/shared",
+            false,
+        );
+        let snapshot = snapshot(
+            PackageManager::Cargo,
+            vec![git, registry.clone()],
+            vec![unit("", Some("rust-app"), &[("shared", &registry.id)])],
+        );
+
+        assert!(command_for(&snapshot, &registry, "1.0.1").is_none());
+    }
+
+    #[test]
+    fn plan_v3_serializes_owners_and_actions_deterministically() {
+        let shared = installed(
+            Ecosystem::Npm,
+            "shared",
+            "1.0.0",
+            "node_modules/shared",
+            true,
+        );
+        let alpha = installed(Ecosystem::Npm, "alpha", "1.0.0", "node_modules/alpha", true);
+        let make_plan = |components, units, vulnerabilities: Vec<Vulnerability>| {
+            let snapshot = snapshot(PackageManager::Npm, components, units);
+            let analysis = analyze_project(
+                snapshot,
+                AnalysisCoverage::new(vec![CoverageArea::StaticImports], Vec::new()),
+            )
+            .unwrap();
+            build_plan(&analysis, &vulnerabilities, &[]).unwrap()
+        };
+        let root = unit(
+            "",
+            Some("root-app"),
+            &[("shared", &shared.id), ("alpha", &alpha.id)],
+        );
+        let nested = unit(
+            "packages/app",
+            Some("nested-app"),
+            &[("shared", &shared.id)],
+        );
+        let first = make_plan(
+            vec![shared.clone(), alpha.clone()],
+            vec![nested.clone(), root.clone()],
+            vec![
+                vulnerability_for(shared.id.clone(), false),
+                vulnerability_for(alpha.id.clone(), false),
+            ],
+        );
+        let second = make_plan(
+            vec![alpha.clone(), shared.clone()],
+            vec![root, nested],
+            vec![
+                vulnerability_for(alpha.id, false),
+                vulnerability_for(shared.id, false),
+            ],
+        );
+
+        assert_eq!(first.schema_version, 3);
+        let shared_action = first
+            .actions
+            .iter()
+            .find(|action| action.component.name == "shared")
+            .unwrap();
+        assert_eq!(
+            shared_action
+                .owners
+                .iter()
+                .map(ProjectUnitId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["unit:.", "unit:packages/app"]
+        );
+        assert_eq!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+        assert_ne!(first.schema_version, 2);
     }
 }

@@ -9,8 +9,8 @@ use serde::Deserialize;
 
 use crate::evidence::ManifestSection;
 use crate::model::{
-    Component, ComponentId, DependencyEdge, DependencyKind, Ecosystem, ProjectSnapshot,
-    ProjectUnit, UnitDeclaration,
+    Component, ComponentId, DependencyEdge, DependencyKind, Ecosystem, PackageManager,
+    ProjectSnapshot, ProjectUnit, UnitDeclaration,
 };
 
 use super::EcosystemAdapter;
@@ -80,7 +80,9 @@ impl EcosystemAdapter for CargoAdapter {
             }
         }
 
-        ProjectSnapshot::new(root.to_path_buf(), components, edges).with_units(units)
+        ProjectSnapshot::new(root.to_path_buf(), components, edges)
+            .with_units(units)?
+            .with_package_manager(PackageManager::Cargo)
     }
 }
 
@@ -356,6 +358,7 @@ fn cargo_project_units(
                     })
                     .collect(),
             )
+            .with_name(record.manifest.package_name().map(str::to_string))
         })
         .collect()
 }
