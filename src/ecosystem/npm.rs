@@ -55,7 +55,10 @@ fn build_v2_snapshot(
         {
             continue;
         }
-        let name = extract_package_name_from_path(location);
+        let name = info
+            .name
+            .clone()
+            .unwrap_or_else(|| extract_package_name_from_path(location));
         if name.is_empty() {
             continue;
         }
@@ -131,10 +134,11 @@ fn build_v1_snapshot(
 
     let mut ids_by_location = HashMap::new();
     for record in &records {
+        let (name, version) = npm_v1_identity(&record.name, &record.dependency.version);
         let id = ComponentId {
             ecosystem: Ecosystem::Npm,
-            name: record.name.clone(),
-            version: record.dependency.version.clone(),
+            name,
+            version,
             location: Some(record.location.clone()),
         };
         ids_by_location.insert(record.location.clone(), id);
@@ -297,6 +301,20 @@ fn extract_package_name_from_path(path: &str) -> String {
     name_part.split('/').next().unwrap_or_default().to_string()
 }
 
+fn npm_v1_identity(installed_name: &str, version: &str) -> (String, String) {
+    let Some(alias) = version.strip_prefix("npm:") else {
+        return (installed_name.to_string(), version.to_string());
+    };
+    let Some(separator) = alias.rfind('@') else {
+        return (installed_name.to_string(), version.to_string());
+    };
+    let (package, version) = (&alias[..separator], &alias[separator + 1..]);
+    if package.is_empty() || version.is_empty() {
+        return (installed_name.to_string(), version.to_string());
+    }
+    (package.to_string(), version.to_string())
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct NpmLockfile {
@@ -309,6 +327,7 @@ struct NpmLockfile {
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct NpmPackageInfo {
+    name: Option<String>,
     version: Option<String>,
     link: Option<bool>,
     dev: Option<bool>,
@@ -331,7 +350,10 @@ struct NpmDependency {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_package_name_from_path;
+    use std::path::{Path, PathBuf};
+
+    use super::{build_v2_snapshot, extract_package_name_from_path, npm_v1_identity, NpmLockfile};
+    use crate::ecosystem::javascript::{ManifestRecord, PackageJson};
 
     #[test]
     fn extracts_scoped_and_nested_names() {
@@ -346,6 +368,57 @@ mod tests {
         assert_eq!(
             extract_package_name_from_path("node_modules/foo/node_modules/bar"),
             "bar"
+        );
+    }
+
+    #[test]
+    fn aliases_retain_the_resolved_package_identity() {
+        let lockfile: NpmLockfile = serde_json::from_str(
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/local-alias": {
+                        "name": "actual-package",
+                        "version": "1.2.3"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let alias = &lockfile.packages["node_modules/local-alias"];
+        assert_eq!(alias.name.as_deref(), Some("actual-package"));
+
+        assert_eq!(
+            npm_v1_identity("local-alias", "npm:actual-package@1.2.3"),
+            ("actual-package".to_string(), "1.2.3".to_string())
+        );
+        assert_eq!(
+            npm_v1_identity("local-alias", "npm:@scope/actual@1.2.3"),
+            ("@scope/actual".to_string(), "1.2.3".to_string())
+        );
+
+        let manifest: PackageJson = serde_json::from_str(
+            r#"{
+                "name": "alias-app",
+                "dependencies": { "local-alias": "npm:actual-package@1.2.3" }
+            }"#,
+        )
+        .unwrap();
+        let snapshot = build_v2_snapshot(
+            Path::new("."),
+            lockfile,
+            vec![ManifestRecord {
+                directory: PathBuf::new(),
+                path: PathBuf::from("package.json"),
+                manifest,
+            }],
+        )
+        .unwrap();
+        assert_eq!(snapshot.components[0].id.name, "actual-package");
+        assert_eq!(snapshot.units[0].declarations[0].name, "local-alias");
+        assert_eq!(
+            snapshot.units[0].declarations[0].component.name,
+            "actual-package"
         );
     }
 }

@@ -15,7 +15,7 @@ Version 3 changes:
 
 - analysis project units expose their normalized package/workspace name, and Rust coverage distinguishes unresolved external references from paths that syntax alone cannot classify;
 - plan actions expose a deterministically ordered `owners` list containing every project unit that declares the exact `ComponentId`;
-- suggested remediation commands use the normalized package manager and exact single owner. They are omitted for transitive components, multiple owners, unsafe identifiers or package IDs that the manager cannot select unambiguously.
+- suggested remediation commands use the normalized package manager and exactly one `UnitDeclaration`, including its owner, source-level name and dependency section. Section-preserving flags are emitted only where the manager syntax is supported and tested. Commands are omitted for transitive components, multiple declarations, unsafe identifiers, unsupported alias syntax or package IDs that the manager cannot select unambiguously.
 
 Analysis and plan schema version 2 consumers must migrate explicitly; version 3 adds required identity context and is not silently emitted as version 2.
 
