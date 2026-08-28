@@ -28,17 +28,28 @@ No-evidence results are deliberately phrased as review candidates, not as proof 
 
 ## Installation
 
+Install the latest release that is actually published on crates.io:
+
 ```bash
-cargo install depx
+cargo install depx --locked
 ```
 
-Or build from source:
+The version on `main` may be newer than the published crate. To install the current development branch instead:
+
+```bash
+cargo install depx --git https://github.com/ruidosujeira/depx.git --branch main --locked
+```
+
+For an exactly reproducible source install, check out a specific commit and keep the committed lockfile:
 
 ```bash
 git clone https://github.com/ruidosujeira/depx
 cd depx
-cargo install --path .
+git switch --detach FULL_COMMIT_SHA
+cargo install --path . --locked
 ```
+
+Replace `FULL_COMMIT_SHA` with the complete commit ID you reviewed.
 
 ## Quick start
 
@@ -77,7 +88,7 @@ Dependency Remediation Plan
    Suggested command: npm install minimist@1.2.6
 ```
 
-Priority is based on advisory severity and observed reachability. Direct dependencies get package-manager-aware commands; transitive findings identify the remediation root and dependency chain. `--verbose` shows up to five shortest useful chains per component and `--json` emits the versioned plan schema.
+Priority is based on advisory severity and observed reachability. Direct dependencies get a package-manager-aware command only when depx can prove one exact manifest declaration: owner, declaration name, dependency section and package manager. npm and Yarn commands retain development, optional or peer sections with the corresponding manager flag; pnpm updates retain the existing supported section; Cargo selects an unambiguous package ID. Commands are omitted for ambiguous declarations, unsupported sections or aliases whose update syntax cannot be proven safe. Transitive findings identify the remediation root and dependency chain. `--verbose` shows up to five shortest useful chains per component and `--json` emits the versioned plan schema.
 
 ```bash
 depx plan
@@ -218,7 +229,7 @@ depx duplicates --json
 
 JavaScript/TypeScript evidence includes static imports, CommonJS `require`, dynamic imports, re-exports, supported configuration files and scripts from every declared project unit. Node built-ins and their subpaths (for example `fs/promises`, `assert/strict` and `node:test`) are excluded. Rust evidence includes `use`, `extern crate`, crate-qualified paths and macro references, classified across runtime, build, test and development sources.
 
-Workspace manifests become explicit project units. Each source observation is owned by its most specific declared unit and resolves only through that unit's exact declarations and package-manager context. Valid workspace members are scanned; unrelated nested projects are excluded. Yarn Berry locators, including virtual peer contexts, and pnpm peer-qualified locations remain distinct component identities.
+Workspace manifests become explicit project units. Each source observation is owned by its most specific declared unit and resolves only through that unit's exact declarations and package-manager context. Valid workspace members are scanned; unrelated nested projects are excluded. Yarn Berry locators, including virtual peer contexts, and pnpm peer-qualified locations remain distinct component identities. If the same installation is declared by multiple units, or multiple declarations in one unit resolve to it, the plan reports every owner but omits a single update command.
 
 Static analysis cannot prove absence. depx reports coverage limitations for computed module names, framework plugin discovery, arbitrary shell behavior, generated sources, conditional Rust compilation and macro expansion.
 
@@ -238,14 +249,15 @@ The dependency direction is intentionally one-way: ecosystem adapters → normal
 
 ## Machine-readable schemas
 
-Public machine-readable formats are explicitly versioned. The current analysis/finding schema, baseline schema, remediation-plan schema and duplicate-analysis schema are version `2`; SARIF uses the `depx/v2` fingerprint key. Version 2 introduces project units and evidence ownership, exact vulnerability component identity, semantic finding fingerprints and objective duplicate facts. Version 1 baselines must be regenerated with `depx baseline` because their occurrence-sensitive IDs are intentionally incompatible. See [docs/schemas.md](docs/schemas.md) for compatibility details.
+Public machine-readable formats are explicitly versioned. Analysis JSON and remediation-plan JSON use schema version `3`. Finding IDs, baselines and duplicate-analysis JSON use version `2`; SARIF fingerprints use the `depx/v2` namespace. Version 3 adds normalized project-unit context and exact declaration owners without changing the version 2 identity contracts. Version 1 baselines must be regenerated with `depx baseline` because their occurrence-sensitive IDs are intentionally incompatible. See [docs/schemas.md](docs/schemas.md) for compatibility details.
 
 ## Development
 
 ```bash
-cargo fmt --all --check
+cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+cargo test --all-targets --all-features
+cargo build --release
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, [SECURITY.md](SECURITY.md) for private vulnerability reporting and [CHANGELOG.md](CHANGELOG.md) for release notes.

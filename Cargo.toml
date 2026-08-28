@@ -9,10 +9,9 @@ homepage = "https://github.com/ruidosujeira/depx"
 readme = "README.md"
 keywords = ["javascript", "typescript", "npm", "cargo", "dependencies"]
 categories = ["command-line-utilities", "development-tools"]
-# The example app and the gif-generation script aren't needed to build or use
-# the crate; keep the published package lean (the demo gif itself stays, so the
-# README renders on crates.io).
-exclude = ["examples", "assets/demo.tape"]
+# Development-only fixtures, automation and duplicate demo sources are not
+# needed to build or use the crate. The README asset stays for crates.io.
+exclude = [".github", "examples", "assets/demo.tape", "/demo.gif"]
 
 [dependencies]
 # CLI

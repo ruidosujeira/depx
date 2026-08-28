@@ -6,11 +6,12 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::{UsageAssessment, UsageState};
-use crate::evidence::Confidence;
+use crate::evidence::{Confidence, ManifestSection};
 use crate::finding::{DuplicateKind, FindingDetails, ProjectAnalysis};
 use crate::graph::DependencyGraph;
 use crate::model::{
     Component, ComponentId, Ecosystem, PackageManager, ProjectSnapshot, ProjectUnit, ProjectUnitId,
+    UnitDeclaration,
 };
 use crate::types::{DeprecatedPackage, Severity, Vulnerability};
 
@@ -184,12 +185,7 @@ pub fn build_plan(
         };
         let command = (kind == PlanActionKind::SecurityUpgrade)
             .then(|| {
-                direct_update_command(
-                    component,
-                    target_version.as_deref(),
-                    &analysis.snapshot,
-                    &owners,
-                )
+                direct_update_command(component, target_version.as_deref(), &analysis.snapshot)
             })
             .flatten();
         actions.push(new_action(ActionInput {
@@ -427,6 +423,20 @@ fn declaration_owners(snapshot: &ProjectSnapshot, component: &ComponentId) -> Ve
     owners
 }
 
+fn exact_declaration<'a>(
+    snapshot: &'a ProjectSnapshot,
+    component: &ComponentId,
+) -> Option<(&'a ProjectUnit, &'a UnitDeclaration)> {
+    let mut matches = snapshot.units.iter().flat_map(|unit| {
+        unit.declarations
+            .iter()
+            .filter(move |declaration| declaration.component == *component)
+            .map(move |declaration| (unit, declaration))
+    });
+    let declaration = matches.next()?;
+    matches.next().is_none().then_some(declaration)
+}
+
 fn highest_fixed_version(vulnerabilities: &[&Vulnerability]) -> Option<String> {
     let versions: Vec<_> = vulnerabilities
         .iter()
@@ -467,50 +477,85 @@ fn direct_update_command(
     component: &Component,
     target: Option<&str>,
     snapshot: &ProjectSnapshot,
-    owners: &[ProjectUnitId],
 ) -> Option<String> {
-    if !component.direct || owners.len() != 1 {
+    if !component.direct {
         return None;
     }
     let target = target?;
-    let owner = snapshot.unit(&owners[0])?;
+    let (owner, declaration) = exact_declaration(snapshot, &component.id)?;
     match snapshot.package_manager? {
         PackageManager::Npm | PackageManager::Pnpm | PackageManager::Yarn => {
-            javascript_update_command(snapshot, owner, component, target)
+            javascript_update_command(snapshot, owner, declaration, component, target)
         }
-        PackageManager::Cargo => cargo_update_command(snapshot, component, target),
+        PackageManager::Cargo => cargo_update_command(snapshot, declaration, component, target),
     }
 }
 
 fn javascript_update_command(
     snapshot: &ProjectSnapshot,
     owner: &ProjectUnit,
+    declaration: &UnitDeclaration,
     component: &Component,
     target: &str,
 ) -> Option<String> {
     if component.id.ecosystem != Ecosystem::Npm
-        || !valid_npm_name(&component.id.name)
+        || declaration.name != component.id.name
+        || !valid_npm_name(&declaration.name)
         || Version::parse(target).is_err()
     {
         return None;
     }
-    let package = format!("{}@{target}", component.id.name);
+    let section_flag = match (snapshot.package_manager?, declaration.section) {
+        (PackageManager::Npm, ManifestSection::Dependencies) => None,
+        (PackageManager::Npm, ManifestSection::DevDependencies) => Some("--save-dev"),
+        (PackageManager::Npm, ManifestSection::OptionalDependencies) => Some("--save-optional"),
+        (PackageManager::Npm, ManifestSection::PeerDependencies) => Some("--save-peer"),
+        (
+            PackageManager::Pnpm,
+            ManifestSection::Dependencies
+            | ManifestSection::DevDependencies
+            | ManifestSection::OptionalDependencies,
+        ) => None,
+        (PackageManager::Yarn, ManifestSection::Dependencies) => None,
+        (PackageManager::Yarn, ManifestSection::DevDependencies) => Some("--dev"),
+        (PackageManager::Yarn, ManifestSection::OptionalDependencies) => Some("--optional"),
+        (PackageManager::Yarn, ManifestSection::PeerDependencies) => Some("--peer"),
+        _ => return None,
+    };
+    let package = format!("{}@{target}", declaration.name);
     if owner.root.as_os_str().is_empty() {
-        return Some(match snapshot.package_manager? {
+        if snapshot.package_manager == Some(PackageManager::Yarn) && snapshot.units.len() > 1 {
+            return None;
+        }
+        let mut command = match snapshot.package_manager? {
             PackageManager::Npm => format!("npm install {package}"),
             PackageManager::Pnpm => format!("pnpm update {package}"),
             PackageManager::Yarn => format!("yarn add {package}"),
             PackageManager::Cargo => return None,
-        });
+        };
+        if let Some(flag) = section_flag {
+            command.push(' ');
+            command.push_str(flag);
+        }
+        return Some(command);
     }
 
     let workspace = exact_workspace_name(snapshot, owner)?;
-    Some(match snapshot.package_manager? {
-        PackageManager::Npm => format!("npm install {package} --workspace {workspace}"),
+    let mut command = match snapshot.package_manager? {
+        PackageManager::Npm => format!("npm install {package}"),
         PackageManager::Pnpm => format!("pnpm --filter {workspace} update {package}"),
         PackageManager::Yarn => format!("yarn workspace {workspace} add {package}"),
         PackageManager::Cargo => return None,
-    })
+    };
+    if let Some(flag) = section_flag {
+        command.push(' ');
+        command.push_str(flag);
+    }
+    if snapshot.package_manager == Some(PackageManager::Npm) {
+        command.push_str(" --workspace ");
+        command.push_str(workspace);
+    }
+    Some(command)
 }
 
 fn exact_workspace_name<'a>(
@@ -529,11 +574,20 @@ fn exact_workspace_name<'a>(
 
 fn cargo_update_command(
     snapshot: &ProjectSnapshot,
+    declaration: &UnitDeclaration,
     component: &Component,
     target: &str,
 ) -> Option<String> {
     if component.id.ecosystem != Ecosystem::Cargo
         || component.id.location.is_none()
+        || !matches!(
+            declaration.section,
+            ManifestSection::Dependencies
+                | ManifestSection::DevDependencies
+                | ManifestSection::BuildDependencies
+                | ManifestSection::WorkspaceDependencies
+        )
+        || !valid_cargo_name(&declaration.name)
         || !valid_cargo_name(&component.id.name)
         || Version::parse(&component.id.version).is_err()
         || Version::parse(target).is_err()
@@ -853,8 +907,32 @@ mod tests {
         component: &Component,
         target: &str,
     ) -> Option<String> {
-        let owners = declaration_owners(snapshot, &component.id);
-        direct_update_command(component, Some(target), snapshot, &owners)
+        direct_update_command(component, Some(target), snapshot)
+    }
+
+    fn unit_in_section(
+        root: &str,
+        name: Option<&str>,
+        declaration_name: &str,
+        component: &ComponentId,
+        section: ManifestSection,
+    ) -> ProjectUnit {
+        let root = PathBuf::from(root);
+        let manifest = root.join(match component.ecosystem {
+            Ecosystem::Cargo => "Cargo.toml",
+            Ecosystem::Npm => "package.json",
+        });
+        ProjectUnit::new(
+            root,
+            manifest,
+            component.ecosystem,
+            vec![UnitDeclaration {
+                name: declaration_name.to_string(),
+                component: component.clone(),
+                section,
+            }],
+        )
+        .with_name(name.map(str::to_string))
     }
 
     #[test]
@@ -876,6 +954,75 @@ mod tests {
             command_for(&snapshot, &component, "1.2.6").as_deref(),
             Some("npm install minimist@1.2.6")
         );
+    }
+
+    #[test]
+    fn npm_commands_preserve_dev_optional_and_peer_sections() {
+        for (name, section, expected_flag) in [
+            (
+                "test-runner",
+                ManifestSection::DevDependencies,
+                "--save-dev",
+            ),
+            (
+                "platform-helper",
+                ManifestSection::OptionalDependencies,
+                "--save-optional",
+            ),
+            (
+                "framework",
+                ManifestSection::PeerDependencies,
+                "--save-peer",
+            ),
+        ] {
+            let component = installed(
+                Ecosystem::Npm,
+                name,
+                "1.0.0",
+                &format!("node_modules/{name}"),
+                true,
+            );
+            let snapshot = snapshot(
+                PackageManager::Npm,
+                vec![component.clone()],
+                vec![unit_in_section(
+                    "",
+                    Some("root-app"),
+                    name,
+                    &component.id,
+                    section,
+                )],
+            );
+
+            assert_eq!(
+                command_for(&snapshot, &component, "1.0.1").as_deref(),
+                Some(format!("npm install {name}@1.0.1 {expected_flag}").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn javascript_alias_without_a_provably_correct_target_is_omitted() {
+        let component = installed(
+            Ecosystem::Npm,
+            "real-package",
+            "1.0.0",
+            "node_modules/local-alias",
+            true,
+        );
+        let snapshot = snapshot(
+            PackageManager::Npm,
+            vec![component.clone()],
+            vec![unit_in_section(
+                "",
+                Some("root-app"),
+                "local-alias",
+                &component.id,
+                ManifestSection::Dependencies,
+            )],
+        );
+
+        assert!(command_for(&snapshot, &component, "1.0.1").is_none());
     }
 
     #[test]
@@ -926,6 +1073,39 @@ mod tests {
         );
 
         assert_eq!(declaration_owners(&snapshot, &component.id).len(), 2);
+        assert!(command_for(&snapshot, &component, "1.0.1").is_none());
+    }
+
+    #[test]
+    fn multiple_declarations_in_one_owner_have_no_single_command() {
+        let component = installed(
+            Ecosystem::Npm,
+            "shared",
+            "1.0.0",
+            "node_modules/shared",
+            true,
+        );
+        let owner = ProjectUnit::new(
+            PathBuf::new(),
+            PathBuf::from("package.json"),
+            Ecosystem::Npm,
+            vec![
+                UnitDeclaration {
+                    name: "shared".to_string(),
+                    component: component.id.clone(),
+                    section: ManifestSection::Dependencies,
+                },
+                UnitDeclaration {
+                    name: "shared-dev".to_string(),
+                    component: component.id.clone(),
+                    section: ManifestSection::DevDependencies,
+                },
+            ],
+        )
+        .with_name(Some("root-app".to_string()));
+        let snapshot = snapshot(PackageManager::Npm, vec![component.clone()], vec![owner]);
+
+        assert_eq!(declaration_owners(&snapshot, &component.id).len(), 1);
         assert!(command_for(&snapshot, &component, "1.0.1").is_none());
     }
 
@@ -1016,6 +1196,54 @@ mod tests {
     }
 
     #[test]
+    fn yarn_update_preserves_the_development_section() {
+        let component = installed(
+            Ecosystem::Npm,
+            "test-runner",
+            "1.0.0",
+            "packages/app/node_modules/test-runner",
+            true,
+        );
+        let snapshot = snapshot(
+            PackageManager::Yarn,
+            vec![component.clone()],
+            vec![unit_in_section(
+                "packages/app",
+                Some("yarn-app"),
+                "test-runner",
+                &component.id,
+                ManifestSection::DevDependencies,
+            )],
+        );
+
+        assert_eq!(
+            command_for(&snapshot, &component, "1.0.1").as_deref(),
+            Some("yarn workspace yarn-app add test-runner@1.0.1 --dev")
+        );
+    }
+
+    #[test]
+    fn yarn_workspace_root_command_is_omitted_when_manager_generation_is_unknown() {
+        let component = installed(
+            Ecosystem::Npm,
+            "shared",
+            "1.0.0",
+            "node_modules/shared",
+            true,
+        );
+        let snapshot = snapshot(
+            PackageManager::Yarn,
+            vec![component.clone()],
+            vec![
+                unit("", Some("root-app"), &[("shared", &component.id)]),
+                unit("packages/app", Some("yarn-app"), &[]),
+            ],
+        );
+
+        assert!(command_for(&snapshot, &component, "1.0.1").is_none());
+    }
+
+    #[test]
     fn cargo_command_disambiguates_two_installed_versions() {
         let old = installed(
             Ecosystem::Cargo,
@@ -1040,6 +1268,33 @@ mod tests {
         assert_eq!(
             command_for(&snapshot, &old, "0.3.31").as_deref(),
             Some("cargo update -p time@0.3.30 --precise 0.3.31")
+        );
+    }
+
+    #[test]
+    fn cargo_alias_resolves_to_the_exact_package_id() {
+        let component = installed(
+            Ecosystem::Cargo,
+            "actual-package",
+            "1.0.0",
+            "registry+https://github.com/rust-lang/crates.io-index",
+            true,
+        );
+        let snapshot = snapshot(
+            PackageManager::Cargo,
+            vec![component.clone()],
+            vec![unit_in_section(
+                "",
+                Some("rust-app"),
+                "local_alias",
+                &component.id,
+                ManifestSection::Dependencies,
+            )],
+        );
+
+        assert_eq!(
+            command_for(&snapshot, &component, "1.0.1").as_deref(),
+            Some("cargo update -p actual-package@1.0.0 --precise 1.0.1")
         );
     }
 

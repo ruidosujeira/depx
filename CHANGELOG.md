@@ -4,6 +4,8 @@ All notable changes to depx are documented here. The project follows Semantic Ve
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-27
+
 ### Added
 
 - Rust source analysis for `use`, `extern crate`, crate paths and macro references, with role-aware runtime, build and test evidence.
@@ -31,6 +33,7 @@ All notable changes to depx are documented here. The project follows Semantic Ve
 
 ### Fixed
 
+- Remediation commands now require one exact manifest declaration, retain supported dependency sections and are omitted for aliases or declaration ambiguities that cannot be represented safely.
 - Rust coverage reports unresolved explicit external references and separately exposes paths that cannot be classified safely from source syntax.
 - Source and script resolution is scoped to the owning workspace unit, and unrelated nested projects are not scanned.
 - Advisories without usable severity data are no longer mislabeled as medium.
@@ -42,4 +45,5 @@ All notable changes to depx are documented here. The project follows Semantic Ve
 - Finding identities, baselines, JSON plans and SARIF fingerprints are deterministic.
 - The validation workflow now runs formatting, Clippy, build and tests on Linux, macOS and Windows.
 
-[Unreleased]: https://github.com/ruidosujeira/depx/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ruidosujeira/depx/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ruidosujeira/depx/compare/v0.4.0...v0.6.0
